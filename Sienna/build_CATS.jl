@@ -28,6 +28,26 @@ additional_fields(::Type{HydroDispatch}) = Dict{Symbol, Any}(
     :operation_cost => HydroGenerationCost(nothing),
 )
 
+additional_fields(::Type{Source}) = Dict{Symbol, Any}(
+    :operation_cost => ImportExportCost(nothing),
+)
+
+# most things have a prime mover type...
+function maybe_add_prime_mover_type!(
+    d::Dict{Symbol, Any},
+    pm_type::PSY.PrimeMovers,
+    ::Type{<:StaticInjection}
+)
+    d[:prime_mover_type] = pm_type
+end
+
+# ...except for imports and SCs.
+maybe_add_prime_mover_type!(
+    ::Dict{Symbol, Any},
+    ::PSY.PrimeMovers,
+    ::Type{<:Union{Source, SynchronousCondenser}}
+) = nothing
+
 """
 A somewhat hacky way of converting a ThermalStandard generator to another type of generator.
 """
@@ -35,9 +55,9 @@ function try_convert(T::Type{<:StaticInjection}, gen::ThermalStandard, pm_type::
     commonKeys = intersect(fieldnames(ThermalStandard), fieldnames(T))
     old_data = Dict(key=>getfield(gen, key) for key ∈ commonKeys)
     delete!.((old_data,), (:operation_cost, :internal, :prime_mover_type))
+    maybe_add_prime_mover_type!(old_data, pm_type, T)
     return T(;
         old_data...,
-        prime_mover_type = pm_type,
         additional_fields(T)...
     )
 end
@@ -71,9 +91,14 @@ attach_cost!(gen::RenewableDispatch, ::Nothing) =
 attach_cost!(gen::HydroDispatch, cost::Union{CostCurve, Nothing}) = 
     set_operation_cost!(gen, HydroGenerationCost(cost, 0.0))
 
-
 attach_cost!(gen::HydroDispatch, ::Nothing) = 
     set_operation_cost!(gen, HydroGenerationCost(nothing))
+
+attach_cost!(gen::Source, cost::CostCurve) = 
+    set_operation_cost!(gen, ImportExportCost(; import_offer_curves = cost, energy_export_weekly_limit = 0.0))
+
+attach_cost!(gen::Source, ::Nothing) = 
+    set_operation_cost!(gen, ImportExportCost(; import_offer_curves = zero(CostCurve), energy_export_weekly_limit = 0.0))
 
 # TODO I think I want the CATS_gens.csv file after all.
 function build_CATS_system(
@@ -105,6 +130,14 @@ function build_CATS_system(
             renewable_gen = try_convert(RenewableDispatch, gen, pm_type)
             remove_component!(system, gen)
             add_component!(system, renewable_gen)
+        elseif gen_type == "IMPORT"
+            import_gen = try_convert(Source, gen, pm_type)
+            remove_component!(system, gen)
+            add_component!(system, import_gen)
+        elseif gen_type == "Synchronous Condenser"
+            sc_gen = try_convert(SynchronousCondenser, gen, pm_type)
+            remove_component!(system, gen)
+            add_component!(system, sc_gen)
         else
             # non-renewable non-hydro remain ThermalStandard
             # FIXME imports and synchronous condensers should not be generators at all.
@@ -142,50 +175,42 @@ function build_CATS_system(
                 # TODO CoPilot generated: are these reasonable?
                 set_ramp_limits!(gen, (up = 0.01, down = 0.01))
                 set_time_limits!(gen, (up = 1.0, down = 1.0))
-            else
-                missing_keys += 1
-                push!(needed_keys, (pm_type, fuel_type))
             end
-        
-            # set fields from matpower data (are these handled already? might be.)
-            #=
-            @assert isapprox(get_active_power(gen), matpower_row[:Pg])
-            @assert isapprox(get_reactive_power(gen), matpower_row[:Qg])
-            @assert isapprox(get_max_active_power(gen), matpower_row[:Pmax])
-            @assert isapprox(get_min_active_power(gen), matpower_row[:Pmin])
-            =#
-
-
         end
 
 
         # comp may be different than gen if we converted it
         comp  = get_component(StaticInjection, system, gen_name)
-        set_prime_mover_type!(comp, PM_TYPE_DICT[row[:FuelType]])
+        if !(comp isa Source) && !(comp isa SynchronousCondenser)
+            set_prime_mover_type!(comp, PM_TYPE_DICT[row[:FuelType]])
+        end
 
         # some data validity checks
         if VALIDITY_CHECKS
             matpower_row = gen_df[i, :]
-            # csv is in natural units; system object is in per unit with 100 MVA base.
-            @assert isapprox(get_active_power(comp), row[:Pg])
+
+            if !(comp isa SynchronousCondenser)
+                @assert isapprox(get_active_power(comp), row[:Pg])
+                @assert isapprox(row[:Pmax], matpower_row[:Pmax])
+                @assert isapprox(row[:Pmin], matpower_row[:Pmin])
+            end
+
             @assert isapprox(get_reactive_power(comp), row[:Qg])
             @assert isapprox(row[:Pg], matpower_row[:Pg])
             @assert isapprox(row[:Qg], matpower_row[:Qg])
-            @assert isapprox(row[:Pmax], matpower_row[:Pmax])
-            @assert isapprox(row[:Pmin], matpower_row[:Pmin])
 
-            if !(comp isa RenewableDispatch)
+            @assert isapprox(get_reactive_power_limits(comp).max, row[:Qmax])
+            @assert isapprox(get_reactive_power_limits(comp).min, row[:Qmin])
+
+            if !(comp isa RenewableDispatch) && !(comp isa SynchronousCondenser)
                 @assert isapprox(get_active_power_limits(comp).max, row[:Pmax])
                 @assert isapprox(get_active_power_limits(comp).min, row[:Pmin])
-                @assert isapprox(get_reactive_power_limits(comp).max, row[:Qmax])
-                @assert isapprox(get_reactive_power_limits(comp).min, row[:Qmin])
             end
         end
     end
 
 
     # STEP 2: attach timeseries data
-    # FIXME there's a separate column in the CSV for imports
     col_to_type_and_kwargs = Dict(
         "Solar" => (RenewableDispatch, Dict(:prime_mover_type => PrimeMovers.PVe)),
         "Wind" => (RenewableDispatch, Dict(:prime_mover_type => PrimeMovers.WT)),
@@ -194,6 +219,7 @@ function build_CATS_system(
         # here I should really have "fuel not nuclear", but I'll special-case it.
         "Thermal" => (ThermalStandard, Dict()),
         "Load" => (PowerLoad, Dict()),
+        "Imports" => (Source, Dict())
     )
 
     ts_df = CSV.read(timeseries_csv, DataFrame; 
@@ -262,11 +288,18 @@ function build_CATS_system(
         c1 = row[:c1]
         c0 = row[:c0]
         if all((c2, c1, c0) .== 0.0)
-            # no cost data
-            attach_cost!(comp, nothing)
+            # cost is zero (SCs don't have an operation cost)
+            comp isa SynchronousCondenser || attach_cost!(comp, nothing)
             continue
         end
-        function_data = QuadraticCurve(c2, c1, c0)
+
+        if comp isa Source
+            # ImportExportCost must be piecewise incremental, when we have quadratic.
+            # so for simplicity we drop the quadratic term.
+            function_data = PiecewiseIncrementalCurve(c0, [0.0, Inf], [c1])
+        else
+            function_data = QuadraticCurve(c2, c1, c0)
+        end
         cost_curve = CostCurve(function_data)
         attach_cost!(comp, cost_curve)
     end

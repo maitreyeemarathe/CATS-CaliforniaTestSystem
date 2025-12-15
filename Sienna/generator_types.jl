@@ -25,7 +25,8 @@ const PM_TYPE_DICT = Dict{String, PSY.PrimeMovers}(
     "Natural Gas Steam Turbine" => PrimeMovers.ST,
     "Other Natural Gas" => PrimeMovers.OT,
 
-    # TODO these shouldn't be handled as generators, but as their own structs...
+    # no prime mover type--handled as SynchronousCondenser and Source structs--but still
+    # included here for code flow simplicity. 
     "Synchronous Condenser" => PrimeMovers.OT,
     "IMPORT" => PrimeMovers.OT, 
     
