@@ -95,10 +95,10 @@ attach_cost!(gen::HydroDispatch, ::Nothing) =
     set_operation_cost!(gen, HydroGenerationCost(nothing))
 
 attach_cost!(gen::Source, cost::CostCurve) = 
-    set_operation_cost!(gen, ImportExportCost(; import_offer_curves = cost, energy_export_weekly_limit = 0.0))
+    set_operation_cost!(gen, ImportExportCost(; import_offer_curves = cost))
 
 attach_cost!(gen::Source, ::Nothing) = 
-    set_operation_cost!(gen, ImportExportCost(; import_offer_curves = zero(CostCurve), energy_export_weekly_limit = 0.0))
+    set_operation_cost!(gen, ImportExportCost(; import_offer_curves = zero(CostCurve)))
 
 # TODO I think I want the CATS_gens.csv file after all.
 function build_CATS_system(
@@ -248,6 +248,31 @@ function build_CATS_system(
         ts_values = convert(Vector{Float64}, ts_values)
         total_max_active_power = sum(get_max_active_power(comp) for comp in comps)
         ts_values ./= total_max_active_power
+        if comp_type != Source
+            # imports can be negative (i.e., exports)
+            @assert all(ts_values .>= 0.0) "time series goes negative for some time " *
+                "steps for $comp_type"
+        elseif comp_type != RenewableDispatch && comp_type != Source
+            total_min_active_power = sum(get_active_power_limits(comp).min for comp in comps)
+            renormalized_min = total_min_active_power / total_max_active_power
+            @assert all(ts_values .>= renormalized_min) "time series goes below min " *
+                "generation for some time steps for $comp_type"
+        end
+        if any(ts_values .> 1.0)
+            scale_up = maximum(ts_values)
+            @warn "total generation (from time series csv) exceeds total of max active "*
+                 "powers for some time steps for $comp_type; multiplying max active " *
+                 "powers for those components by $(round(scale_up; sigdigits = 3))"
+            ts_values ./= scale_up
+            for comp in comps
+                set_active_power_limits!(
+                    comp,
+                    (min = get_active_power_limits(comp).min,
+                     max = get_active_power_limits(comp).max * scale_up)
+                )
+            end
+            @assert all(ts_values .<= 1.0)
+        end
 	    ts = SingleTimeSeries(;
            name = "max_active_power",
            data = TimeArray(timestamps, ts_values),
