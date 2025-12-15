@@ -42,16 +42,18 @@ function try_convert(T::Type{<:StaticInjection}, gen::ThermalStandard, pm_type::
     )
 end
 
-function fix_missings!(data::AbstractVector{Float64})
+function fix_missings!(data::Vector{Union{Float64, Missing}})
     last_valid = 0.0
     for i in eachindex(data)
-        if isnan(data[i]) || ismissing(data[i])
+        if ismissing(data[i]) || isnan(data[i])
             data[i] = last_valid
         else
             last_valid = data[i]
         end
     end
 end
+
+fix_missings!(data::Vector{Float64}) = nothing # no-op
 
 
 attach_cost!(gen::ThermalStandard, cost::Union{CostCurve}) =
