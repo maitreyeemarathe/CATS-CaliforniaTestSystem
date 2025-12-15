@@ -100,11 +100,11 @@ attach_cost!(gen::Source, cost::CostCurve) =
 attach_cost!(gen::Source, ::Nothing) = 
     set_operation_cost!(gen, ImportExportCost(; import_offer_curves = zero(CostCurve)))
 
-# TODO I think I want the CATS_gens.csv file after all.
-function build_CATS_system(
+function build_CATS_system(;
     matpower_file::String = "$BASE_DIR/MATPOWER/CaliforniaTestSystem.m",
     generator_csv::String = "$BASE_DIR/GIS/CATS_gens.csv",
     timeseries_csv::String = joinpath(DATA_DIR, "HourlyProduction2019.csv"),
+    first_order::Bool = false
 )
 
     system = System(matpower_file)
@@ -140,7 +140,6 @@ function build_CATS_system(
             add_component!(system, sc_gen)
         else
             # non-renewable non-hydro remain ThermalStandard
-            # FIXME imports and synchronous condensers should not be generators at all.
             # fields unique to thermal: fuel type, ramp limits, time limits
             set_prime_mover_type!(gen, pm_type)
             if occursin("Natural Gas", gen_type)
@@ -177,7 +176,6 @@ function build_CATS_system(
                 set_time_limits!(gen, (up = 1.0, down = 1.0))
             end
         end
-
 
         # comp may be different than gen if we converted it
         comp  = get_component(StaticInjection, system, gen_name)
@@ -322,6 +320,8 @@ function build_CATS_system(
             # ImportExportCost must be piecewise incremental, when we have quadratic.
             # so for simplicity we drop the quadratic term.
             function_data = PiecewiseIncrementalCurve(c0, [0.0, Inf], [c1])
+        elseif first_order
+            function_data = LinearCurve(c1, c0)
         else
             function_data = QuadraticCurve(c2, c1, c0)
         end
