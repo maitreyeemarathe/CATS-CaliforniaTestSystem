@@ -3,6 +3,7 @@ using CSV
 using DataFrames
 using Dates
 using TimeSeries
+using JLD2
 
 const PSY = PowerSystems
 
@@ -104,7 +105,8 @@ function build_CATS_system(;
     matpower_file::String = "$BASE_DIR/MATPOWER/CaliforniaTestSystem.m",
     generator_csv::String = "$BASE_DIR/GIS/CATS_gens.csv",
     timeseries_csv::String = joinpath(DATA_DIR, "HourlyProduction2019.csv"),
-    first_order::Bool = false
+    load_timeseries::Union{Nothing, String} = joinpath(DATA_DIR, "Load_Agg_Post_Assignment_v3_latest.csv"),
+    first_order::Bool = false,
 )
 
     system = System(matpower_file)
@@ -216,9 +218,11 @@ function build_CATS_system(;
         "Nuclear" => (ThermalStandard, Dict(:fuel => ThermalFuels.NUCLEAR)),
         # here I should really have "fuel not nuclear", but I'll special-case it.
         "Thermal" => (ThermalStandard, Dict()),
-        "Load" => (PowerLoad, Dict()),
         "Imports" => (Source, Dict())
     )
+    if isnothing(load_timeseries)
+        col_to_type_and_kwargs["Load"] = (PowerLoad, Dict())
+    end
 
     ts_df = CSV.read(timeseries_csv, DataFrame; 
         header=1,
@@ -293,6 +297,72 @@ function build_CATS_system(;
                 ))
             end
             @assert isapprox(total_generation, ts_df[validity_check_row, col_name])
+        end
+    end
+
+    # STEP 2B: attach per-load time series.
+    # this will dramatically increase the memory footprint of the system...
+    if !isnothing(load_timeseries)
+        
+        # Try to load from JLD2 first.
+        jld2_file = replace(load_timeseries, ".csv" => ".jld2")
+        if endswith(load_timeseries, ".jld2")
+            jld2_file = load_timeseries
+        end
+        
+        load_data = nothing
+        if isfile(jld2_file)
+            println("Loading time series data from JLD2: $jld2_file")
+            load_data = load(jld2_file, "load_data")
+        elseif isfile(load_timeseries)
+            @warn "JLD2 file not found, falling back to CSV (slow). " *
+                  "Run convert_load_csv_to_jld2.jl to create JLD2 file."
+            @assert false "Please convert CSV to JLD2 first using convert_load_csv_to_jld2.jl"
+        else
+            error("Neither JLD2 nor CSV file found for load timeseries")
+        end
+        
+        increased = 0
+        most_increase = 0.0
+        
+        begin_time_series_update(system) do
+            n_buses = size(load_data, 1)
+            for i in 1:n_buses
+                load_name = "bus$i"
+                load = get_component(PowerLoad, system, load_name)
+                
+                row_values = view(load_data, i, :)
+                
+                # Early skip for zero loads
+                if isnothing(load)
+                    @assert all(row_values .== 0.0)
+                    continue
+                end
+                
+                real_values = real.(row_values)
+                @assert all(real_values .>= 0.0)
+                max_ts = maximum(real_values)
+                
+                if max_ts > get_max_active_power(load)
+                    increased += 1
+                    most_increase = max(most_increase, max_ts / get_max_active_power(load))
+                    set_max_active_power!(load, max_ts)
+                end
+                @assert all(real_values .<= get_max_active_power(load) + 1e-6)
+                
+                ts = SingleTimeSeries(;
+                    name = "max_active_power",
+                    data = TimeArray(timestamps, collect(real_values)),
+                    scaling_factor_multiplier = nothing,
+                )
+                add_time_series!(system, load, ts)
+            end
+            if increased > 0
+                num_loads = length(get_components(PowerLoad, system))
+                @warn "increased max active power for $increased (of $num_loads) loads based "*
+                    "on load time series; largest increase was by a factor of " *
+                    "$(round(most_increase; sigdigits=3))"
+            end
         end
     end
 
