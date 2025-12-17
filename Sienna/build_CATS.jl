@@ -74,8 +74,7 @@ function fix_missings!(data::Vector{Union{Float64, Missing}})
     end
 end
 
-fix_missings!(data::Vector{Float64}) = nothing # no-op
-
+fix_missings!(::Vector{Float64}) = nothing # no-op
 
 attach_cost!(gen::ThermalStandard, cost::Union{CostCurve}) =
     set_operation_cost!(gen, ThermalGenerationCost(cost, 0.0, 0, 0.0))
@@ -303,7 +302,6 @@ function build_CATS_system(;
     # STEP 2B: attach per-load time series.
     # this will dramatically increase the memory footprint of the system...
     if !isnothing(load_timeseries)
-        
         # Try to load from JLD2 first.
         jld2_file = replace(load_timeseries, ".csv" => ".jld2")
         if endswith(load_timeseries, ".jld2")
@@ -314,6 +312,12 @@ function build_CATS_system(;
         if isfile(jld2_file)
             println("Loading time series data from JLD2: $jld2_file")
             load_data = load(jld2_file, "load_data")
+            if VALIDITY_CHECKS
+                # first row of CSV should match first column of load_data.
+                first_row_csv = first(CSV.Rows(load_timeseries; header=false))
+                first_row_complex = parse.(ComplexF64, collect(first_row_csv))
+                @assert all(isapprox.(view(load_data, :, 1), first_row_complex))
+            end
         elseif isfile(load_timeseries)
             @warn "JLD2 file not found, falling back to CSV (slow). " *
                   "Run convert_load_csv_to_jld2.jl to create JLD2 file."
@@ -331,7 +335,7 @@ function build_CATS_system(;
                 load_name = "bus$i"
                 load = get_component(PowerLoad, system, load_name)
                 
-                row_values = view(load_data, i, :)
+                row_values = view(load_data, :, i)
                 
                 # Early skip for zero loads
                 if isnothing(load)
@@ -350,10 +354,13 @@ function build_CATS_system(;
                 end
                 @assert all(real_values .<= get_max_active_power(load) + 1e-6)
                 
+                # PSI prefers values to be between 0 and 1.
+                real_values ./= get_max_active_power(load)
+
                 ts = SingleTimeSeries(;
                     name = "max_active_power",
-                    data = TimeArray(timestamps, collect(real_values)),
-                    scaling_factor_multiplier = nothing,
+                    data = TimeArray(timestamps, real_values),
+                    scaling_factor_multiplier = get_max_active_power,
                 )
                 add_time_series!(system, load, ts)
             end

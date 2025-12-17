@@ -6,6 +6,11 @@ DATA_DIR = "$(homedir())/Documents/julia/CATS-project/CATS-CaliforniaTestSystem/
 csv_file = joinpath(DATA_DIR, "Load_Agg_Post_Assignment_v3_latest.csv")
 jld2_file = joinpath(DATA_DIR, "Load_Agg_Post_Assignment_v3_latest.jld2")
 
+if isfile(jld2_file)
+    println("JLD2 file already exists at $jld2_file. Delete it first if you want to recreate.")
+    exit(0)
+end
+
 println("Reading CSV file: $csv_file")
 println("This may take several minutes...")
 
