@@ -396,7 +396,7 @@ function build_CATS_system(;
         if comp isa Source
             # ImportExportCost must be piecewise incremental, when we have quadratic.
             # so for simplicity we drop the quadratic term.
-            function_data = PiecewiseIncrementalCurve(c0, [0.0, Inf], [c1])
+            function_data = PiecewiseIncrementalCurve(c0, [0.0, 1.0e12], [c1])
         elseif first_order
             function_data = LinearCurve(c1, c0)
         else
