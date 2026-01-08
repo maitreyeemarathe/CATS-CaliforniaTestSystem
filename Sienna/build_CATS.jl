@@ -111,16 +111,17 @@ function build_CATS_system(;
     system = System(matpower_file)
     # everything in the CSV is in natural units.
     set_units_base_system!(system, "NATURAL_UNITS")
+    n_buses = length(get_components(Bus, system))
+    n_gens = length(get_components(ThermalStandard, system))
+    # n_loads = length(get_components(PowerLoad, system))
     gen_csv = CSV.read(generator_csv, DataFrame)
     gen_df = generator_data_to_dataframe(matpower_file)
-
-    needed_keys = Set{Tuple{PrimeMovers, ThermalFuels}}()
-    missing_keys = 0
 
     # STEP 1: fix gen types. All are parsed as ThermalStandard, but some are hydro or renewable.
     for (i, row) in enumerate(eachrow(gen_csv))
         gen_name = "gen-$(i)"
         gen = get_component(ThermalStandard, system, gen_name)
+        @assert !isnothing(gen) "Generator $gen_name not found in system."
         gen_type  = row[:FuelType]
         pm_type = PM_TYPE_DICT[gen_type]
         if occursin("Hydroelectric", gen_type)
@@ -208,6 +209,24 @@ function build_CATS_system(;
         end
     end
 
+    if VALIDITY_CHECKS
+        # check first one
+        @assert n_gens == nrow(gen_csv)
+        first_gen = get_component(StaticInjection, system, "gen-1")
+        @assert first_gen isa HydroDispatch
+        @assert isapprox(get_reactive_power_limits(first_gen).max, 18.7771429)
+        @assert get_number(get_bus(first_gen)) == 745
+        # check last non-SC non-import generator.
+        n_imports = length(get_components(Source, system))
+        n_scs = length(get_components(SynchronousCondenser, system))
+        last_gen_index = n_gens - n_imports - n_scs
+        last_gen = get_component(StaticInjection, system, "gen-$(last_gen_index)")
+        @assert last_gen isa RenewableDispatch && get_prime_mover_type(last_gen) == PrimeMovers.PVe
+        
+        first_import = get_component(Source, system, "gen-$(last_gen_index + 1)")
+        @assert !isnothing(first_import)
+    end
+
 
     # STEP 2: attach timeseries data
     col_to_type_and_kwargs = Dict(
@@ -228,7 +247,9 @@ function build_CATS_system(;
         types=(i, name) -> i <= 3 ? String : Float64,
     )
 
-    timestamps = range(DateTime("2019-01-01T00:00:00"); step = Hour(1), length = nrow(ts_df))
+    timestamps = range(DateTime("2019-01-01T00:00:00"); step = Hour(1), length = 24*365)
+    @assert length(timestamps) == nrow(ts_df) "Number of timestamps ($(length(timestamps))) " *
+        "does not match number of rows in time series data ($(nrow(ts_df)))."
     for (col_name, col_info) in col_to_type_and_kwargs
 
         comp_type, kwargs = col_info
@@ -300,7 +321,6 @@ function build_CATS_system(;
     end
 
     # STEP 2B: attach per-load time series.
-    # this will dramatically increase the memory footprint of the system...
     if !isnothing(load_timeseries)
         # Try to load from JLD2 first.
         jld2_file = replace(load_timeseries, ".csv" => ".jld2")
@@ -325,12 +345,12 @@ function build_CATS_system(;
         else
             error("Neither JLD2 nor CSV file found for load timeseries")
         end
+        @assert size(load_data, 2) == n_buses "Number of columns in load time series data " *
+            "($(ncol(load_data))) does not match number of buses ($n_buses)"
         
         increased = 0
         most_increase = 0.0
-        
         begin_time_series_update(system) do
-            n_buses = size(load_data, 1)
             for i in 1:n_buses
                 load_name = "bus$i"
                 load = get_component(PowerLoad, system, load_name)
@@ -341,10 +361,13 @@ function build_CATS_system(;
                 if isnothing(load)
                     @assert all(row_values .== 0.0)
                     continue
+                else
+                    @assert get_number(get_bus(load)) == i "expected load $load_name to "*
+                        "be at bus $i, got bus $(get_number(get_bus(load)))"
                 end
                 
                 real_values = real.(row_values)
-                @assert all(real_values .>= 0.0)
+                @assert all(real_values .>= 0.0) "Negative real values found for load $load_name"
                 max_ts = maximum(real_values)
                 
                 if max_ts > get_max_active_power(load)
@@ -376,6 +399,8 @@ function build_CATS_system(;
     # STEP 3: add cost data
 
     cost_df = cost_data_to_dataframe(matpower_file)
+    @assert n_gens == nrow(cost_df) "Number of generators in system ($n_gens) does not "* 
+        "match number of rows in cost data ($nrow(cost_df))"
     for (i, row) in enumerate(eachrow(cost_df))
         gen_name = "gen-$(i)"
         comp = get_component(StaticInjection, system, gen_name)
