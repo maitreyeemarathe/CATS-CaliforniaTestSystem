@@ -106,6 +106,7 @@ function build_CATS_system(;
     timeseries_csv::String = joinpath(DATA_DIR, "HourlyProduction2019.csv"),
     load_timeseries::Union{Nothing, String} = joinpath(DATA_DIR, "Load_Agg_Post_Assignment_v3_latest.csv"),
     first_order::Bool = false,
+    remove_scs::Bool = true,
 )
 
     system = System(matpower_file)
@@ -227,6 +228,18 @@ function build_CATS_system(;
         @assert !isnothing(first_import)
     end
 
+    # Remove SCs at buses not in the allowed list
+    if remove_scs
+        scs_file = joinpath(BASE_DIR, "data", "scs.csv")
+        scs_df = CSV.read(scs_file, DataFrame)
+        allowed_buses = Set(scs_df.bus_number)
+        for sc in collect(get_components(SynchronousCondenser, system))
+            bus_number = get_number(get_bus(sc))
+            if bus_number ∉ allowed_buses
+                remove_component!(system, sc)
+            end
+        end
+    end
 
     # STEP 2: attach timeseries data
     col_to_type_and_kwargs = Dict(
@@ -404,6 +417,7 @@ function build_CATS_system(;
     for (i, row) in enumerate(eachrow(cost_df))
         gen_name = "gen-$(i)"
         comp = get_component(StaticInjection, system, gen_name)
+        isnothing(comp) && continue  # skip removed components (e.g., SCs)
         @assert row[:startup] == 0.0
         @assert row[:shutdown] == 0.0
         n = row[:n]
