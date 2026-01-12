@@ -13,11 +13,7 @@ BASE_DIR = joinpath(@__DIR__, "..")
 
 VALIDITY_CHECKS = true
 
-# hardcoded to other CATS repo for now.
-# Download from "Time-series data" link at
-# https://github.com/WISPO-POP/CATS-CaliforniaTestSystem?tab=readme-ov-file
-DATA_DIR = "$(homedir())/Documents/julia/CATS-project/CATS-CaliforniaTestSystem/data/"
-
+DATA_DIR = joinpath(BASE_DIR, "data")
 additional_fields(::Type{T}) where T<:StaticInjection = Dict{Symbol, Any}()
 
 additional_fields(::Type{RenewableDispatch}) = Dict{Symbol, Any}(
@@ -76,19 +72,19 @@ end
 
 fix_missings!(::Vector{Float64}) = nothing # no-op
 
-attach_cost!(gen::ThermalStandard, cost::Union{CostCurve}) =
+attach_cost!(gen::ThermalStandard, cost::CostCurve) =
     set_operation_cost!(gen, ThermalGenerationCost(cost, 0.0, 0, 0.0))
 
 attach_cost!(gen::ThermalStandard, ::Nothing) =
     set_operation_cost!(gen, ThermalGenerationCost(nothing))
 
-attach_cost!(gen::RenewableDispatch, cost::Union{CostCurve}) =
+attach_cost!(gen::RenewableDispatch, cost::CostCurve) =
     set_operation_cost!(gen, RenewableGenerationCost(cost))
 
 attach_cost!(gen::RenewableDispatch, ::Nothing) =
     set_operation_cost!(gen, RenewableGenerationCost(nothing))
 
-attach_cost!(gen::HydroDispatch, cost::Union{CostCurve, Nothing}) = 
+attach_cost!(gen::HydroDispatch, cost::CostCurve) = 
     set_operation_cost!(gen, HydroGenerationCost(cost, 0.0))
 
 attach_cost!(gen::HydroDispatch, ::Nothing) = 
@@ -104,10 +100,18 @@ function build_CATS_system(;
     matpower_file::String = "$BASE_DIR/MATPOWER/CaliforniaTestSystem.m",
     generator_csv::String = "$BASE_DIR/GIS/CATS_gens.csv",
     timeseries_csv::String = joinpath(DATA_DIR, "HourlyProduction2019.csv"),
-    load_timeseries::Union{Nothing, String} = joinpath(DATA_DIR, "Load_Agg_Post_Assignment_v3_latest.csv"),
+    load_timeseries::String = joinpath(DATA_DIR, "Load_Agg_Post_Assignment_v3_latest.csv"),
     first_order::Bool = false,
     remove_scs::Bool = true,
 )
+    if !isfile(timeseries_csv) || !isfile(load_timeseries)
+        error("Data directory $DATA_DIR does not contain expected data. Please download " *
+            "time series (HourlyProduction2019.csv) and load (Load_Agg_Post_Assignment_v3_"*
+            "latest.csv) data from the Google drive linked at "*
+            "https://github.com/WISPO-POP/CATS-CaliforniaTestSystem?tab=readme-ov-file"
+        )
+    end 
+
 
     system = System(matpower_file)
     # everything in the CSV is in natural units.
@@ -142,7 +146,7 @@ function build_CATS_system(;
             remove_component!(system, gen)
             add_component!(system, sc_gen)
         else
-            # non-renewable non-hydro remain ThermalStandard
+            # the rest remain ThermalStandard
             # fields unique to thermal: fuel type, ramp limits, time limits
             set_prime_mover_type!(gen, pm_type)
             if occursin("Natural Gas", gen_type)
@@ -229,6 +233,7 @@ function build_CATS_system(;
     end
 
     # Remove SCs at buses not in the allowed list
+    # (SCs don't contribute active power, so need not worry about time series stuff)
     if remove_scs
         scs_file = joinpath(BASE_DIR, "data", "scs.csv")
         scs_df = CSV.read(scs_file, DataFrame)
@@ -334,78 +339,75 @@ function build_CATS_system(;
     end
 
     # STEP 2B: attach per-load time series.
-    if !isnothing(load_timeseries)
-        # Try to load from JLD2 first.
-        jld2_file = replace(load_timeseries, ".csv" => ".jld2")
-        if endswith(load_timeseries, ".jld2")
-            jld2_file = load_timeseries
+    # Try to load from JLD2 first.
+    jld2_file = replace(load_timeseries, ".csv" => ".jld2")
+    if endswith(load_timeseries, ".jld2")
+        jld2_file = load_timeseries
+    end
+    
+    load_data = nothing
+    if isfile(jld2_file)
+        println("Loading time series data from JLD2: $jld2_file")
+        load_data = load(jld2_file, "load_data")
+        if VALIDITY_CHECKS
+            # first row of CSV should match first column of load_data.
+            first_row_csv = first(CSV.Rows(load_timeseries; header=false))
+            first_row_complex = parse.(ComplexF64, collect(first_row_csv))
+            @assert all(isapprox.(view(load_data, :, 1), first_row_complex))
         end
-        
-        load_data = nothing
-        if isfile(jld2_file)
-            println("Loading time series data from JLD2: $jld2_file")
-            load_data = load(jld2_file, "load_data")
-            if VALIDITY_CHECKS
-                # first row of CSV should match first column of load_data.
-                first_row_csv = first(CSV.Rows(load_timeseries; header=false))
-                first_row_complex = parse.(ComplexF64, collect(first_row_csv))
-                @assert all(isapprox.(view(load_data, :, 1), first_row_complex))
+    elseif isfile(load_timeseries)
+        # I could load from CSV, but users probably don't actually want to do that.
+        error("Please convert CSV to JLD2 first using convert_load_csv_to_jld2.jl." *
+            " (It takes ~10 minutes to load the CSV, versus ~10 seconds for JLD2, " *
+            "so writing that intermediate JDL2 file saves significant build time.)")
+    end
+    @assert size(load_data, 2) == n_buses "Number of columns in load time series data " *
+        "($(ncol(load_data))) does not match number of buses ($n_buses)"
+    
+    increased = 0
+    most_increase = 0.0
+    begin_time_series_update(system) do
+        for i in 1:n_buses
+            load_name = "bus$i"
+            load = get_component(PowerLoad, system, load_name)
+            
+            row_values = view(load_data, :, i)
+            
+            # Early skip for zero loads
+            if isnothing(load)
+                @assert all(row_values .== 0.0)
+                continue
+            else
+                @assert get_number(get_bus(load)) == i "expected load $load_name to "*
+                    "be at bus $i, got bus $(get_number(get_bus(load)))"
             end
-        elseif isfile(load_timeseries)
-            @warn "JLD2 file not found, falling back to CSV (slow). " *
-                  "Run convert_load_csv_to_jld2.jl to create JLD2 file."
-            @assert false "Please convert CSV to JLD2 first using convert_load_csv_to_jld2.jl"
-        else
-            error("Neither JLD2 nor CSV file found for load timeseries")
-        end
-        @assert size(load_data, 2) == n_buses "Number of columns in load time series data " *
-            "($(ncol(load_data))) does not match number of buses ($n_buses)"
-        
-        increased = 0
-        most_increase = 0.0
-        begin_time_series_update(system) do
-            for i in 1:n_buses
-                load_name = "bus$i"
-                load = get_component(PowerLoad, system, load_name)
-                
-                row_values = view(load_data, :, i)
-                
-                # Early skip for zero loads
-                if isnothing(load)
-                    @assert all(row_values .== 0.0)
-                    continue
-                else
-                    @assert get_number(get_bus(load)) == i "expected load $load_name to "*
-                        "be at bus $i, got bus $(get_number(get_bus(load)))"
-                end
-                
-                real_values = real.(row_values)
-                @assert all(real_values .>= 0.0) "Negative real values found for load $load_name"
-                max_ts = maximum(real_values)
-                
-                if max_ts > get_max_active_power(load)
-                    increased += 1
-                    most_increase = max(most_increase, max_ts / get_max_active_power(load))
-                    set_max_active_power!(load, max_ts)
-                end
-                @assert all(real_values .<= get_max_active_power(load) + 1e-6)
-                
-                # PSI prefers values to be between 0 and 1.
-                real_values ./= get_max_active_power(load)
+            
+            real_values = real.(row_values)
+            @assert all(real_values .>= 0.0) "Negative real values found for load $load_name"
+            max_ts = maximum(real_values)
+            
+            if max_ts > get_max_active_power(load)
+                increased += 1
+                most_increase = max(most_increase, max_ts / get_max_active_power(load))
+                set_max_active_power!(load, max_ts)
+            end
+            @assert all(real_values .<= get_max_active_power(load) + 1e-6)
+            
+            # PSI prefers values to be between 0 and 1.
+            real_values ./= get_max_active_power(load)
 
-                ts = SingleTimeSeries(;
-                    name = "max_active_power",
-                    data = TimeArray(timestamps, real_values),
-                    scaling_factor_multiplier = get_max_active_power,
-                )
-                add_time_series!(system, load, ts)
-            end
-            if increased > 0
-                num_loads = length(get_components(PowerLoad, system))
-                @warn "increased max active power for $increased (of $num_loads) loads based "*
-                    "on load time series; largest increase was by a factor of " *
-                    "$(round(most_increase; sigdigits=3))"
-            end
+            ts = SingleTimeSeries(;
+                name = "max_active_power",
+                data = TimeArray(timestamps, real_values),
+                scaling_factor_multiplier = get_max_active_power,
+            )
+            add_time_series!(system, load, ts)
+        end
+        if increased > 0
+            num_loads = length(get_components(PowerLoad, system))
+            @warn "increased max active power for $increased (of $num_loads) loads based "*
+                "on load time series; largest increase was by a factor of " *
+                "$(round(most_increase; sigdigits=3))"
         end
     end
 

@@ -2,7 +2,7 @@ using CSV
 using JLD2
 
 # Path to the CSV file
-DATA_DIR = "$(homedir())/Documents/julia/CATS-project/CATS-CaliforniaTestSystem/data/"
+DATA_DIR = joinpath(@__DIR__, "..", "data")
 csv_file = joinpath(DATA_DIR, "Load_Agg_Post_Assignment_v3_latest.csv")
 jld2_file = joinpath(DATA_DIR, "Load_Agg_Post_Assignment_v3_latest.jld2")
 
