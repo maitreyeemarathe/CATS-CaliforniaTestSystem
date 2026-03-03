@@ -29,6 +29,16 @@ additional_fields(::Type{Source}) = Dict{Symbol, Any}(
     :operation_cost => ImportExportCost(nothing),
 )
 
+additional_fields(::Type{EnergyReservoirStorage}) = Dict{Symbol, Any}(
+    :storage_technology_type => StorageTech.OTHER_THERM,
+    :storage_capacity => 0.0,
+    :storage_level_limits => (0.0, 0.0),
+    :initial_storage_capacity_level => 0.0,
+    :input_active_power_limits => (0.0, 0.0),
+    :output_active_power_limits => (0.0, 0.0),
+    :efficiency => (1.0, 1.0),
+)
+
 # most things have a prime mover type...
 function maybe_add_prime_mover_type!(
     d::Dict{Symbol, Any},
@@ -96,6 +106,12 @@ attach_cost!(gen::Source, cost::CostCurve) =
 attach_cost!(gen::Source, ::Nothing) = 
     set_operation_cost!(gen, ImportExportCost(; import_offer_curves = zero(CostCurve)))
 
+attach_cost!(gen::EnergyReservoirStorage, cost::CostCurve) = 
+    set_operation_cost!(gen, StorageCost(cost, cost, 0, 0.0, 0, 0, 0))
+
+attach_cost!(gen::EnergyReservoirStorage, ::Nothing) =
+    set_operation_cost!(gen, StorageCost())
+
 function build_CATS_system(;
     matpower_file::String = "$BASE_DIR/MATPOWER/CaliforniaTestSystem.m",
     generator_csv::String = "$BASE_DIR/GIS/CATS_gens.csv",
@@ -133,7 +149,7 @@ function build_CATS_system(;
             hydro_gen = try_convert(HydroDispatch, gen, pm_type)
             remove_component!(system, gen)
             add_component!(system, hydro_gen)
-        elseif occursin("Solar", gen_type) || occursin("Wind", gen_type) || occursin("Batteries", gen_type)
+        elseif occursin("Solar", gen_type) || occursin("Wind", gen_type)
             renewable_gen = try_convert(RenewableDispatch, gen, pm_type)
             remove_component!(system, gen)
             add_component!(system, renewable_gen)
@@ -145,6 +161,10 @@ function build_CATS_system(;
             sc_gen = try_convert(SynchronousCondenser, gen, pm_type)
             remove_component!(system, gen)
             add_component!(system, sc_gen)
+        elseif occursin("Batteries", gen_type)
+            battery_gen = try_convert(EnergyReservoirStorage, gen, pm_type)
+            remove_component!(system, gen)
+            add_component!(system, battery_gen)
         else
             # the rest remain ThermalStandard
             # fields unique to thermal: fuel type, ramp limits, time limits
@@ -207,7 +227,7 @@ function build_CATS_system(;
             @assert isapprox(get_reactive_power_limits(comp).max, row[:Qmax])
             @assert isapprox(get_reactive_power_limits(comp).min, row[:Qmin])
 
-            if !(comp isa RenewableDispatch) && !(comp isa SynchronousCondenser)
+            if !(comp isa RenewableDispatch) && !(comp isa SynchronousCondenser) && !(comp isa EnergyReservoirStorage)
                 @assert isapprox(get_active_power_limits(comp).max, row[:Pmax])
                 @assert isapprox(get_active_power_limits(comp).min, row[:Pmin])
             end
