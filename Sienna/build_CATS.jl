@@ -30,9 +30,9 @@ additional_fields(::Type{Source}) = Dict{Symbol, Any}(
 )
 
 additional_fields(::Type{EnergyReservoirStorage}) = Dict{Symbol, Any}(
-    :storage_technology_type => StorageTech.OTHER_THERM,
+    :storage_technology_type => StorageTech.LIB,
     :storage_capacity => 0.0,
-    :storage_level_limits => (0.0, 0.0),
+    :storage_level_limits => (0.0, 1.0),
     :initial_storage_capacity_level => 0.0,
     :input_active_power_limits => (0.0, 0.0),
     :output_active_power_limits => (0.0, 0.0),
@@ -165,6 +165,12 @@ function build_CATS_system(;
             battery_gen = try_convert(EnergyReservoirStorage, gen, pm_type)
             remove_component!(system, gen)
             add_component!(system, battery_gen)
+            k = 4
+            rating = get_rating(battery_gen)
+            set_storage_capacity!(battery_gen, k*rating)
+            pw_limits = (min = 0.0, max = rating)
+            set_input_active_power_limits!(battery_gen, pw_limits)
+            set_output_active_power_limits!(battery_gen, pw_limits)
         else
             # the rest remain ThermalStandard
             # fields unique to thermal: fuel type, ramp limits, time limits
@@ -341,8 +347,9 @@ function build_CATS_system(;
         associations = (TimeSeriesAssociation(comp, ts) for comp in comps)
         bulk_add_time_series!(system, associations)
 
-        # data validity check: total across comps should match csv value.
+        # data validity check
         if VALIDITY_CHECKS
+            # total across comps should match csv value.
             validity_check_row = 9
             total_generation = 0.0
             for comp in comps
@@ -357,6 +364,9 @@ function build_CATS_system(;
             @assert isapprox(total_generation, ts_df[validity_check_row, col_name])
         end
     end
+    # all renewables should have time series values
+    @assert all(comp -> has_time_series(comp, SingleTimeSeries, "max_active_power"),
+                    get_components(RenewableDispatch, system))
 
     # STEP 2B: attach per-load time series.
     # Try to load from JLD2 first.
@@ -457,6 +467,8 @@ function build_CATS_system(;
         if comp isa Source
             # ImportExportCost must be piecewise incremental, when we have quadratic.
             # so for simplicity we drop the quadratic term.
+            # FIXME they use negative exports to represent imports, whereas we use
+            # separate curves...
             function_data = PiecewiseIncrementalCurve(c0, [0.0, 1.0e12], [c1])
         elseif first_order
             function_data = LinearCurve(c1, c0)
