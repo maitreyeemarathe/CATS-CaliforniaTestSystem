@@ -1,37 +1,53 @@
 using Distributed
+global USERNAME = "lkiernan"
+global CATS_DIR = "/scratch/$USERNAME/CATS-CaliforniaTestSystem"
+global DATA_DIR = "/scratch/$USERNAME/CATS-CaliforniaTestSystem/data"
+global SMALL_TEST = false
 addprocs(10)
+# make sure globals are defined on all workers
+@everywhere global CATS_DIR = $CATS_DIR
+@everywhere global DATA_DIR = $DATA_DIR
+@everywhere global SMALL_TEST = $SMALL_TEST
 @everywhere begin
-    global CATS_DIR = "/scratch/jlara/CATS-CaliforniaTestSystem"
-    global DATA_DIR = "/scratch/jlara/CATS-CaliforniaTestSystem"
+    global HSL = false
     using Pkg
     Pkg.activate(CATS_DIR)
+    
     # using MKL
     #using LinearAlgebra
     #BLAS.set_num_threads(1)
-    #Pkg.develop(path = "/home/jlara/HSL_jll.jl-2023.11.7")
-    #using HSL_jll
+    if HSL
+        #Pkg.develop(path = "/home/jlara/HSL_jll.jl-2023.11.7")
+        using HSL_jll
+    end
     using PowerModels
     using JuMP
     using CSV, JSON
     using DataFrames
     using Ipopt
     using Tables
-
     include("$CATS_DIR/Script/test_eval_functions.jl")
 
     function eval(range, NetworkData_input, load_scenarios, load_mapping, HourlyData2019, gen_data)
         @info "begin eval call $(range)"
+        solver_attr = if HSL
+            [
+                "print_level" => 5,
+                "hsllib" => HSL_jll.libhsl_path,
+                "linear_solver" => "ma57"
+            ]
+        else
+            ["print_level" => 5]
+        end
         solver = JuMP.optimizer_with_attributes(() -> Ipopt.Optimizer(),
-            "print_level" => 5,
-            #"hsllib" => HSL_jll.libhsl_path,
-            # "linear_solver" => "ma27"
+            solver_attr...
         )
 
         @info "Ipopt Instantiated"
         NetworkData = deepcopy(NetworkData_input)
         @info "NetworkData initialized"
 
-        N = 8760
+        N = SMALL_TEST ? 10 : 8760
         load_scenarios = load_scenarios[:,1:N]
         condenserIndices = [g for g in 1:size(gen_data)[1] if occursin("condenser", lowercase(gen_data.FuelType[g]))]
         NUM_GENS = size(gen_data)[1]
@@ -76,8 +92,9 @@ addprocs(10)
     end
 end
 
-split_N = 120
-splits = [range(N, N + split_N - 1) for N in 1:split_N:8760]
+split_N = SMALL_TEST ? 1 : 120
+TOTAL = SMALL_TEST ? 10 : 8760
+splits = [range(N, N + split_N - 1) for N in 1:split_N:TOTAL]
 
 load_scenarios = CSV.read("$DATA_DIR/Load_Agg_Post_Assignment_v3_latest.csv",header = false, DataFrame)
 HourlyData2019 = CSV.read("$DATA_DIR/HourlyProduction2019.csv",DataFrame)
