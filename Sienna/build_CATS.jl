@@ -112,9 +112,35 @@ attach_cost!(gen::EnergyReservoirStorage, cost::CostCurve) =
 attach_cost!(gen::EnergyReservoirStorage, ::Nothing) =
     set_operation_cost!(gen, StorageCost())
 
+function convert_to_battery(system::System,
+    gen::StaticInjection,
+    k_p::Float64,
+    k_q::Union{Float64, Nothing} = nothing
+)
+    battery_gen = try_convert(EnergyReservoirStorage, gen, PrimeMovers.BA)
+    remove_component!(system, gen)
+    add_component!(system, battery_gen)
+    # same rating as gen
+    rating = get_rating(battery_gen)
+    # active power: initial 0.0, limits (0, k_p * rating)
+    set_storage_capacity!(battery_gen, k_p*rating)
+    set_active_power!(battery_gen, 0.0)
+    set_initial_storage_capacity_level!(battery_gen, 0.0)
+    p_limits = (min = 0.0, max = k_p*rating)
+    set_input_active_power_limits!(battery_gen, p_limits)
+    set_output_active_power_limits!(battery_gen, p_limits)
+    # reactive power: initial 0.0, limits (-k_q * rating, k_q * rating)
+    if k_q !== nothing
+        q_limits = (min = -k_q*rating, max = k_q*rating)
+        set_reactive_power!(battery_gen, 0.0)
+        set_reactive_power_limits!(battery_gen, q_limits)
+    end
+end
+
 function build_CATS_system(;
     matpower_file::String = "$BASE_DIR/MATPOWER/CaliforniaTestSystem.m",
-    generator_csv::String = "$BASE_DIR/GIS/CATS_gens.csv",
+    generator_csv::String = "$BASE_DIR/GIS/CATS_gens.csv", # oh I think the problem is that we've changed this for the
+    # simplified system.
     timeseries_csv::String = joinpath(DATA_DIR, "HourlyProduction2019.csv"),
     load_timeseries::String = joinpath(DATA_DIR, "Load_Agg_Post_Assignment_v3_latest.csv"),
     first_order::Bool = false,
@@ -138,6 +164,15 @@ function build_CATS_system(;
     gen_csv = CSV.read(generator_csv, DataFrame)
     gen_df = generator_data_to_dataframe(matpower_file)
 
+
+    scs_convert_df = CSV.read(joinpath(BASE_DIR, "data", "scs_to_storage.csv"), DataFrame)
+    scs_convert = Set{String}([replace(x, " " => "-") for x in scs_convert_df.generator])
+    scs_df = CSV.read(joinpath(BASE_DIR, "data", "scs_to_keep.csv"), DataFrame)
+    scs_keep = Set{String}([replace(x, " " => "-") for x in scs_df.generator])
+    original_sc_count = 0
+    converted_scs = 0
+    kept_sc_count = 0
+
     # STEP 1: fix gen types. All are parsed as ThermalStandard, but some are hydro or renewable.
     for (i, row) in enumerate(eachrow(gen_csv))
         gen_name = "gen-$(i)"
@@ -158,19 +193,25 @@ function build_CATS_system(;
             remove_component!(system, gen)
             add_component!(system, import_gen)
         elseif gen_type == "Synchronous Condenser"
-            sc_gen = try_convert(SynchronousCondenser, gen, pm_type)
-            remove_component!(system, gen)
-            add_component!(system, sc_gen)
+            original_sc_count += 1
+            # the SCs-to-keep list here is subject to manual tuning: run on HPC, 
+            # penalizing reactive power at SCs to CSV. See write_sc_bus.jl for details.
+            # there's a handful of the "keep" ones that could be converted to fixed admittance, 
+            # --see fixed_admittance_candidates.csv--but it's only ~25 of 150.
+            if gen_name ∈ scs_convert
+                convert_to_battery(system, gen, 3.0, 3.0)
+                converted_scs += 1
+            elseif gen_name ∈ scs_keep
+                sc_gen = try_convert(SynchronousCondenser, gen, pm_type)
+                remove_component!(system, gen)
+                add_component!(system, sc_gen)
+                kept_sc_count += 1
+            else
+                # if it's not in either list, remove it entirely.
+                remove_component!(system, gen)
+            end
         elseif occursin("Batteries", gen_type)
-            battery_gen = try_convert(EnergyReservoirStorage, gen, pm_type)
-            remove_component!(system, gen)
-            add_component!(system, battery_gen)
-            k = 4
-            rating = get_rating(battery_gen)
-            set_storage_capacity!(battery_gen, k*rating)
-            pw_limits = (min = 0.0, max = rating)
-            set_input_active_power_limits!(battery_gen, pw_limits)
-            set_output_active_power_limits!(battery_gen, pw_limits)
+            convert_to_battery(system, gen, 3.0)
         else
             # the rest remain ThermalStandard
             # fields unique to thermal: fuel type, ramp limits, time limits
@@ -211,27 +252,33 @@ function build_CATS_system(;
         end
 
         # comp may be different than gen if we converted it
+        if gen_type == "Synchronous Condenser" && !(gen_name in scs_keep) && !(gen_name in scs_convert)
+            continue
+        end
         comp  = get_component(StaticInjection, system, gen_name)
-        if !(comp isa Source) && !(comp isa SynchronousCondenser)
+        if !(comp isa Source) && !(comp isa SynchronousCondenser) && !(comp isa EnergyReservoirStorage)
             set_prime_mover_type!(comp, PM_TYPE_DICT[row[:FuelType]])
+        elseif comp isa SynchronousCondenser && gen_name in scs_convert
+            set_prime_mover_type!(comp, PrimeMovers.BA)
         end
 
-        # some data validity checks
+        # some data validity checks on the specific row
+        # (if it's a system wide check, put it outside the for loop)
         if VALIDITY_CHECKS
             matpower_row = gen_df[i, :]
-
-            if !(comp isa SynchronousCondenser)
+            if !(comp isa SynchronousCondenser || comp isa EnergyReservoirStorage)
                 @assert isapprox(get_active_power(comp), row[:Pg])
                 @assert isapprox(row[:Pmax], matpower_row[:Pmax])
                 @assert isapprox(row[:Pmin], matpower_row[:Pmin])
             end
+            if !(gen_name in scs_convert)
+                @assert isapprox(get_reactive_power(comp), row[:Qg])
+                @assert isapprox(row[:Pg], matpower_row[:Pg])
+                @assert isapprox(row[:Qg], matpower_row[:Qg])
 
-            @assert isapprox(get_reactive_power(comp), row[:Qg])
-            @assert isapprox(row[:Pg], matpower_row[:Pg])
-            @assert isapprox(row[:Qg], matpower_row[:Qg])
-
-            @assert isapprox(get_reactive_power_limits(comp).max, row[:Qmax])
-            @assert isapprox(get_reactive_power_limits(comp).min, row[:Qmin])
+                @assert isapprox(get_reactive_power_limits(comp).max, row[:Qmax])
+                @assert isapprox(get_reactive_power_limits(comp).min, row[:Qmin])
+            end
 
             if !(comp isa RenewableDispatch) && !(comp isa SynchronousCondenser) && !(comp isa EnergyReservoirStorage)
                 @assert isapprox(get_active_power_limits(comp).max, row[:Pmax])
@@ -240,6 +287,8 @@ function build_CATS_system(;
         end
     end
 
+    @assert converted_scs == length(scs_convert)
+    @assert kept_sc_count == length(scs_keep)
     if VALIDITY_CHECKS
         # check first one
         @assert n_gens == nrow(gen_csv)
@@ -249,27 +298,12 @@ function build_CATS_system(;
         @assert get_number(get_bus(first_gen)) == 745
         # check last non-SC non-import generator.
         n_imports = length(get_components(Source, system))
-        n_scs = length(get_components(SynchronousCondenser, system))
-        last_gen_index = n_gens - n_imports - n_scs
+        last_gen_index = n_gens - n_imports - original_sc_count
         last_gen = get_component(StaticInjection, system, "gen-$(last_gen_index)")
         @assert last_gen isa RenewableDispatch && get_prime_mover_type(last_gen) == PrimeMovers.PVe
         
         first_import = get_component(Source, system, "gen-$(last_gen_index + 1)")
         @assert !isnothing(first_import)
-    end
-
-    # Remove SCs at buses not in the allowed list
-    # (SCs don't contribute active power, so need not worry about time series stuff)
-    if remove_scs
-        scs_file = joinpath(BASE_DIR, "data", "scs.csv")
-        scs_df = CSV.read(scs_file, DataFrame)
-        allowed_buses = Set(scs_df.bus_number)
-        for sc in collect(get_components(SynchronousCondenser, system))
-            bus_number = get_number(get_bus(sc))
-            if bus_number ∉ allowed_buses
-                remove_component!(system, sc)
-            end
-        end
     end
 
     # STEP 2: attach timeseries data
