@@ -4,6 +4,7 @@ using DataFrames
 using Dates
 using TimeSeries
 using JLD2
+using JSON
 
 const PSY = PowerSystems
 
@@ -141,9 +142,10 @@ function build_CATS_system(;
     matpower_file::String = "$BASE_DIR/MATPOWER/CaliforniaTestSystem.m",
     generator_csv::String = "$BASE_DIR/GIS/CATS_gens.csv", # oh I think the problem is that we've changed this for the
     # simplified system.
+    buses_csv::String = "$BASE_DIR/GIS/CATS_buses.csv",
+    lines_json::String = "$BASE_DIR/GIS/CATS_lines.json",
     timeseries_csv::String = joinpath(DATA_DIR, "HourlyProduction2019.csv"),
     load_timeseries::String = joinpath(DATA_DIR, "Load_Agg_Post_Assignment_v3_latest.csv"),
-    first_order::Bool = false,
     remove_scs::Bool = true,
 )
     if !isfile(timeseries_csv) || !isfile(load_timeseries)
@@ -284,6 +286,17 @@ function build_CATS_system(;
                 @assert isapprox(get_active_power_limits(comp).max, row[:Pmax])
                 @assert isapprox(get_active_power_limits(comp).min, row[:Pmin])
             end
+        end
+
+        # Attach geographic info to generator
+        if !ismissing(row[:Lat]) && !ismissing(row[:Lon])
+            geo_info = GeographicInfo(;
+                geo_json = Dict{String, Any}(
+                    "type" => "Point",
+                    "coordinates" => [row[:Lon], row[:Lat]],
+                ),
+            )
+            add_supplemental_attribute!(system, comp, geo_info)
         end
     end
 
@@ -504,14 +517,74 @@ function build_CATS_system(;
             # FIXME they use negative exports to represent imports, whereas we use
             # separate curves...
             function_data = PiecewiseIncrementalCurve(c0, [0.0, 1.0e12], [c1])
-        elseif first_order
-            function_data = LinearCurve(c1, c0)
         else
-            function_data = QuadraticCurve(c2, c1, c0)
+            p_limits = get_active_power_limits(comp)
+            p_min = p_limits.min
+            p_max = p_limits.max
+            points = [(p, c2 * p^2 + c1 * p + c0) for p in range(p_min, p_max; length = 4)]
+            function_data = PiecewisePointCurve(points)
         end
         cost_curve = CostCurve(function_data)
         attach_cost!(comp, cost_curve)
     end
+
+    # STEP 4: attach geographic info to buses
+    bus_geo_csv = CSV.read(buses_csv, DataFrame)
+    bus_geo_lookup = Dict{Int, GeographicInfo}()
+    for row in eachrow(bus_geo_csv)
+        bus_number = row[:bus_i]
+        geo_info = GeographicInfo(;
+            geo_json = Dict{String, Any}(
+                "type" => "Point",
+                "coordinates" => [row[:Lon], row[:Lat]],
+            ),
+        )
+        bus_geo_lookup[bus_number] = geo_info
+    end
+    buses_with_geo = 0
+    for bus in get_components(ACBus, system)
+        bus_number = get_number(bus)
+        if haskey(bus_geo_lookup, bus_number)
+            add_supplemental_attribute!(system, bus, bus_geo_lookup[bus_number])
+            buses_with_geo += 1
+        end
+    end
+    @info "Attached GeographicInfo to $buses_with_geo / $(length(get_components(ACBus, system))) buses"
+
+    # STEP 5: attach geographic info to lines
+    lines_geo_data = JSON.parsefile(lines_json)
+    # Build lookup: (f_bus, t_bus) => Vector of feature geometries
+    # Multiple features can exist for the same bus pair (parallel lines)
+    line_geo_lookup = Dict{Tuple{Int, Int}, Vector{Dict{String, Any}}}()
+    for feature in lines_geo_data["features"]
+        props = feature["properties"]
+        f_bus = Int(props["f_bus"])
+        t_bus = Int(props["t_bus"])
+        key = (f_bus, t_bus)
+        if !haskey(line_geo_lookup, key)
+            line_geo_lookup[key] = Dict{String, Any}[]
+        end
+        push!(line_geo_lookup[key], feature["geometry"])
+    end
+    lines_with_geo = 0
+    for line in get_components(Line, system)
+        arc = get_arc(line)
+        f_bus = get_number(get_from(arc))
+        t_bus = get_number(get_to(arc))
+        geometries = get(line_geo_lookup, (f_bus, t_bus), nothing)
+        if isnothing(geometries)
+            # Try reversed direction
+            geometries = get(line_geo_lookup, (t_bus, f_bus), nothing)
+        end
+        if !isnothing(geometries) && !isempty(geometries)
+            # Use first available geometry (pop to handle parallel lines)
+            geom = popfirst!(geometries)
+            geo_info = GeographicInfo(; geo_json = geom)
+            add_supplemental_attribute!(system, line, geo_info)
+            lines_with_geo += 1
+        end
+    end
+    @info "Attached GeographicInfo to $lines_with_geo / $(length(get_components(Line, system))) lines"
 
     return system
 end
