@@ -171,9 +171,14 @@ function build_CATS_system(;
     scs_convert = Set{String}([replace(x, " " => "-") for x in scs_convert_df.generator])
     scs_df = CSV.read(joinpath(BASE_DIR, "data", "scs_to_keep.csv"), DataFrame)
     scs_keep = Set{String}([replace(x, " " => "-") for x in scs_df.generator])
+    fa_df = CSV.read(joinpath(BASE_DIR, "data", "fixed_admittance_candidates.csv"), DataFrame)
+    scs_to_fixed_admittance = Dict{String, Float64}(
+        replace(row.generator, " " => "-") => row.median_nonzero for row in eachrow(fa_df)
+    )
     original_sc_count = 0
     converted_scs = 0
     kept_sc_count = 0
+    fixed_admittance_count = 0
 
     # STEP 1: fix gen types. All are parsed as ThermalStandard, but some are hydro or renewable.
     for (i, row) in enumerate(eachrow(gen_csv))
@@ -203,13 +208,25 @@ function build_CATS_system(;
             if gen_name ∈ scs_convert
                 convert_to_battery(system, gen, 3.0, 3.0)
                 converted_scs += 1
+            elseif haskey(scs_to_fixed_admittance, gen_name)
+                fa_bus = get_bus(gen)
+                Q_median = scs_to_fixed_admittance[gen_name]
+                remove_component!(system, gen)
+                fa = FixedAdmittance(;
+                    name = gen_name,
+                    available = true,
+                    bus = fa_bus,
+                    Y = complex(0.0, Q_median / get_base_power(system)),
+                )
+                add_component!(system, fa)
+                fixed_admittance_count += 1
             elseif gen_name ∈ scs_keep
                 sc_gen = try_convert(SynchronousCondenser, gen, pm_type)
                 remove_component!(system, gen)
                 add_component!(system, sc_gen)
                 kept_sc_count += 1
             else
-                # if it's not in either list, remove it entirely.
+                @warn("removed synchronous condenser $(get_name(gen))")
                 remove_component!(system, gen)
             end
         elseif occursin("Batteries", gen_type)
@@ -258,7 +275,7 @@ function build_CATS_system(;
             continue
         end
         comp  = get_component(StaticInjection, system, gen_name)
-        if !(comp isa Source) && !(comp isa SynchronousCondenser) && !(comp isa EnergyReservoirStorage)
+        if !(comp isa Source) && !(comp isa SynchronousCondenser) && !(comp isa EnergyReservoirStorage) && !(comp isa FixedAdmittance)
             set_prime_mover_type!(comp, PM_TYPE_DICT[row[:FuelType]])
         elseif comp isa SynchronousCondenser && gen_name in scs_convert
             set_prime_mover_type!(comp, PrimeMovers.BA)
@@ -268,12 +285,12 @@ function build_CATS_system(;
         # (if it's a system wide check, put it outside the for loop)
         if VALIDITY_CHECKS
             matpower_row = gen_df[i, :]
-            if !(comp isa SynchronousCondenser || comp isa EnergyReservoirStorage)
+            if !(comp isa SynchronousCondenser || comp isa EnergyReservoirStorage || comp isa FixedAdmittance)
                 @assert isapprox(get_active_power(comp), row[:Pg])
                 @assert isapprox(row[:Pmax], matpower_row[:Pmax])
                 @assert isapprox(row[:Pmin], matpower_row[:Pmin])
             end
-            if !(gen_name in scs_convert)
+            if !(gen_name in scs_convert) && !(comp isa FixedAdmittance)
                 @assert isapprox(get_reactive_power(comp), row[:Qg])
                 @assert isapprox(row[:Pg], matpower_row[:Pg])
                 @assert isapprox(row[:Qg], matpower_row[:Qg])
@@ -282,7 +299,7 @@ function build_CATS_system(;
                 @assert isapprox(get_reactive_power_limits(comp).min, row[:Qmin])
             end
 
-            if !(comp isa RenewableDispatch) && !(comp isa SynchronousCondenser) && !(comp isa EnergyReservoirStorage)
+            if !(comp isa RenewableDispatch) && !(comp isa SynchronousCondenser) && !(comp isa EnergyReservoirStorage) && !(comp isa FixedAdmittance)
                 @assert isapprox(get_active_power_limits(comp).max, row[:Pmax])
                 @assert isapprox(get_active_power_limits(comp).min, row[:Pmin])
             end
@@ -301,7 +318,8 @@ function build_CATS_system(;
     end
 
     @assert converted_scs == length(scs_convert)
-    @assert kept_sc_count == length(scs_keep)
+    @assert kept_sc_count == length(scs_keep) - length(scs_to_fixed_admittance)
+    @assert fixed_admittance_count == length(scs_to_fixed_admittance)
     if VALIDITY_CHECKS
         # check first one
         @assert n_gens == nrow(gen_csv)
@@ -317,6 +335,17 @@ function build_CATS_system(;
 
         first_import = get_component(Source, system, "gen-$(last_gen_index + 1)")
         @assert !isnothing(first_import)
+
+        # Check that all gas-fueled ThermalStandard generators have ramp limits and min down time
+        for gen in get_components(ThermalStandard, system)
+            if get_fuel(gen) == ThermalFuels.NATURAL_GAS
+                ramp = get_ramp_limits(gen)
+                @assert ramp.up > 0.0 "Gas generator $(get_name(gen)) has zero ramp up limit"
+                @assert ramp.down > 0.0 "Gas generator $(get_name(gen)) has zero ramp down limit"
+                time_lim = get_time_limits(gen)
+                @assert time_lim.down > 0.0 "Gas generator $(get_name(gen)) has zero min down time"
+            end
+        end
     end
 
     # STEP 2: attach timeseries data
@@ -425,19 +454,19 @@ function build_CATS_system(;
     load_data = nothing
     if isfile(jld2_file)
         println("Loading time series data from JLD2: $jld2_file")
-        load_data = load(jld2_file, "load_data")
-        if VALIDITY_CHECKS
-            # first row of CSV should match first column of load_data.
-            first_row_csv = first(CSV.Rows(load_timeseries; header=false))
-            first_row_complex = parse.(ComplexF64, collect(first_row_csv))
-            @assert all(isapprox.(view(load_data, :, 1), first_row_complex))
-        end
     elseif isfile(load_timeseries)
         # I could load from CSV, but users probably don't actually want to do that.
         @warn("Converting CSV to JLD2 first using convert_load_csv_to_jld2.jl." *
             " (It takes ~10 minutes to load the CSV, versus ~10 seconds for JLD2, " *
             "so writing that intermediate JDL2 file saves significant build time.)")
             include("convert_load_csv_to_jld2.jl")
+    end
+    load_data = load(jld2_file, "load_data")
+    if VALIDITY_CHECKS
+        # first row of CSV should match first column of load_data.
+        first_row_csv = first(CSV.Rows(load_timeseries; header=false))
+        first_row_complex = parse.(ComplexF64, collect(first_row_csv))
+        @assert all(isapprox.(view(load_data, :, 1), first_row_complex))
     end
     @assert size(load_data, 2) == n_buses "Number of columns in load time series data " *
         "($(ncol(load_data))) does not match number of buses ($n_buses)"
@@ -508,7 +537,7 @@ function build_CATS_system(;
         c0 = row[:c0]
         if all((c2, c1, c0) .== 0.0)
             # cost is zero (SCs don't have an operation cost)
-            comp isa SynchronousCondenser || attach_cost!(comp, nothing)
+            (comp isa SynchronousCondenser || comp isa FixedAdmittance) || attach_cost!(comp, nothing)
             continue
         end
 
@@ -520,15 +549,19 @@ function build_CATS_system(;
             function_data = PiecewiseIncrementalCurve(c0, [0.0, 1.0e12], [c1])
         elseif c2 == 0.0
             function_data = LinearCurve(c1, c0)
+        elseif comp isa EnergyReservoirStorage
+            vom = LinearCurve(c1, c0)
+            cost_curve = CostCurve(vom)
+            attach_cost!(comp, cost_curve)
         else
             p_limits = get_active_power_limits(comp)
             p_min = p_limits.min
             p_max = p_limits.max
             points = [(p, c2 * p^2 + c1 * p + c0) for p in range(p_min, p_max; length = 4)]
             function_data = PiecewisePointCurve(points)
+            cost_curve = CostCurve(function_data)
+            attach_cost!(comp, cost_curve)
         end
-        cost_curve = CostCurve(function_data)
-        attach_cost!(comp, cost_curve)
     end
 
     # STEP 4: attach geographic info to buses
@@ -591,3 +624,6 @@ function build_CATS_system(;
 
     return system
 end
+
+system = build_CATS_system()
+to_json(system, joinpath(BASE_DIR, "CATS_Sienna.json"); force=true)
