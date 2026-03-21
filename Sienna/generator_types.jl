@@ -14,8 +14,8 @@ const PM_TYPE_DICT = Dict{String, PSY.PrimeMovers}(
     "Municipal Solid Waste" => PrimeMovers.ST,
     "Other Waste Biomass" => PrimeMovers.ST,
     "Petroleum Liquids" => PrimeMovers.IC,
-    "Geothermal" => PrimeMovers.OT,
-    "Nuclear" => PrimeMovers.OT,
+    "Geothermal" => PrimeMovers.ST,
+    "Nuclear" => PrimeMovers.ST,
     "Wood/Wood Waste Biomass" => PrimeMovers.ST,
     "Conventional Steam Coal" => PrimeMovers.ST,
     "Petroleum Coke" => PrimeMovers.ST,
@@ -26,10 +26,10 @@ const PM_TYPE_DICT = Dict{String, PSY.PrimeMovers}(
     "Other Natural Gas" => PrimeMovers.OT,
 
     # no prime mover type--handled as SynchronousCondenser and Source structs--but still
-    # included here for code flow simplicity. 
+    # included here for code flow simplicity.
     "Synchronous Condenser" => PrimeMovers.OT,
-    "IMPORT" => PrimeMovers.OT, 
-    
+    "IMPORT" => PrimeMovers.OT,
+
     "All Other" => PrimeMovers.OT,
     "Landfill Gas" => PrimeMovers.OT,
     "Other Gases" => PrimeMovers.OT
@@ -55,8 +55,8 @@ const PSY_TO_WECC_DICT = Dict(
     (PrimeMovers.GT, ThermalFuels.NATURAL_GAS) => "SC",
     (PrimeMovers.ST, ThermalFuels.NATURAL_GAS) => "GS",
     # not from WECC: my own invented abbreviations.
-    (PrimeMovers.OT, ThermalFuels.GEOTHERMAL) => "GEO",
-    (PrimeMovers.OT, ThermalFuels.NUCLEAR) => "NUC",
+    (PrimeMovers.ST, ThermalFuels.GEOTHERMAL) => "GEO",
+    (PrimeMovers.ST, ThermalFuels.NUCLEAR) => "NUC",
 )
 
 

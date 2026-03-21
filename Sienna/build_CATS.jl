@@ -95,19 +95,19 @@ attach_cost!(gen::RenewableDispatch, cost::CostCurve) =
 attach_cost!(gen::RenewableDispatch, ::Nothing) =
     set_operation_cost!(gen, RenewableGenerationCost(nothing))
 
-attach_cost!(gen::HydroDispatch, cost::CostCurve) = 
+attach_cost!(gen::HydroDispatch, cost::CostCurve) =
     set_operation_cost!(gen, HydroGenerationCost(cost, 0.0))
 
-attach_cost!(gen::HydroDispatch, ::Nothing) = 
+attach_cost!(gen::HydroDispatch, ::Nothing) =
     set_operation_cost!(gen, HydroGenerationCost(nothing))
 
-attach_cost!(gen::Source, cost::CostCurve) = 
+attach_cost!(gen::Source, cost::CostCurve) =
     set_operation_cost!(gen, ImportExportCost(; import_offer_curves = cost))
 
-attach_cost!(gen::Source, ::Nothing) = 
+attach_cost!(gen::Source, ::Nothing) =
     set_operation_cost!(gen, ImportExportCost(; import_offer_curves = zero(CostCurve)))
 
-attach_cost!(gen::EnergyReservoirStorage, cost::CostCurve) = 
+attach_cost!(gen::EnergyReservoirStorage, cost::CostCurve) =
     set_operation_cost!(gen, StorageCost(cost, cost, 0, 0.0, 0, 0, 0))
 
 attach_cost!(gen::EnergyReservoirStorage, ::Nothing) =
@@ -154,7 +154,7 @@ function build_CATS_system(;
             "latest.csv) data from the Google drive linked at "*
             "https://github.com/WISPO-POP/CATS-CaliforniaTestSystem?tab=readme-ov-file"
         )
-    end 
+    end
 
 
     system = System(matpower_file)
@@ -196,9 +196,9 @@ function build_CATS_system(;
             add_component!(system, import_gen)
         elseif gen_type == "Synchronous Condenser"
             original_sc_count += 1
-            # the SCs-to-keep list here is subject to manual tuning: run on HPC, 
+            # the SCs-to-keep list here is subject to manual tuning: run on HPC,
             # penalizing reactive power at SCs to CSV. See write_sc_bus.jl for details.
-            # there's a handful of the "keep" ones that could be converted to fixed admittance, 
+            # there's a handful of the "keep" ones that could be converted to fixed admittance,
             # --see fixed_admittance_candidates.csv--but it's only ~25 of 150.
             if gen_name ∈ scs_convert
                 convert_to_battery(system, gen, 3.0, 3.0)
@@ -314,7 +314,7 @@ function build_CATS_system(;
         last_gen_index = n_gens - n_imports - original_sc_count
         last_gen = get_component(StaticInjection, system, "gen-$(last_gen_index)")
         @assert last_gen isa RenewableDispatch && get_prime_mover_type(last_gen) == PrimeMovers.PVe
-        
+
         first_import = get_component(Source, system, "gen-$(last_gen_index + 1)")
         @assert !isnothing(first_import)
     end
@@ -333,7 +333,7 @@ function build_CATS_system(;
         col_to_type_and_kwargs["Load"] = (PowerLoad, Dict())
     end
 
-    ts_df = CSV.read(timeseries_csv, DataFrame; 
+    ts_df = CSV.read(timeseries_csv, DataFrame;
         header=1,
         types=(i, name) -> i <= 3 ? String : Float64,
     )
@@ -421,7 +421,7 @@ function build_CATS_system(;
     if endswith(load_timeseries, ".jld2")
         jld2_file = load_timeseries
     end
-    
+
     load_data = nothing
     if isfile(jld2_file)
         println("Loading time series data from JLD2: $jld2_file")
@@ -434,22 +434,23 @@ function build_CATS_system(;
         end
     elseif isfile(load_timeseries)
         # I could load from CSV, but users probably don't actually want to do that.
-        error("Please convert CSV to JLD2 first using convert_load_csv_to_jld2.jl." *
+        @warn("Converting CSV to JLD2 first using convert_load_csv_to_jld2.jl." *
             " (It takes ~10 minutes to load the CSV, versus ~10 seconds for JLD2, " *
             "so writing that intermediate JDL2 file saves significant build time.)")
+            include("convert_load_csv_to_jld2.jl")
     end
     @assert size(load_data, 2) == n_buses "Number of columns in load time series data " *
         "($(ncol(load_data))) does not match number of buses ($n_buses)"
-    
+
     increased = 0
     most_increase = 0.0
     begin_time_series_update(system) do
         for i in 1:n_buses
             load_name = "bus$i"
             load = get_component(PowerLoad, system, load_name)
-            
+
             row_values = view(load_data, :, i)
-            
+
             # Early skip for zero loads
             if isnothing(load)
                 @assert all(row_values .== 0.0)
@@ -458,18 +459,18 @@ function build_CATS_system(;
                 @assert get_number(get_bus(load)) == i "expected load $load_name to "*
                     "be at bus $i, got bus $(get_number(get_bus(load)))"
             end
-            
+
             real_values = real.(row_values)
             @assert all(real_values .>= 0.0) "Negative real values found for load $load_name"
             max_ts = maximum(real_values)
-            
+
             if max_ts > get_max_active_power(load)
                 increased += 1
                 most_increase = max(most_increase, max_ts / get_max_active_power(load))
                 set_max_active_power!(load, max_ts)
             end
             @assert all(real_values .<= get_max_active_power(load) + 1e-6)
-            
+
             # PSI prefers values to be between 0 and 1.
             real_values ./= get_max_active_power(load)
 
@@ -491,7 +492,7 @@ function build_CATS_system(;
     # STEP 3: add cost data
 
     cost_df = cost_data_to_dataframe(matpower_file)
-    @assert n_gens == nrow(cost_df) "Number of generators in system ($n_gens) does not "* 
+    @assert n_gens == nrow(cost_df) "Number of generators in system ($n_gens) does not "*
         "match number of rows in cost data ($nrow(cost_df))"
     for (i, row) in enumerate(eachrow(cost_df))
         gen_name = "gen-$(i)"
@@ -517,6 +518,8 @@ function build_CATS_system(;
             # FIXME they use negative exports to represent imports, whereas we use
             # separate curves...
             function_data = PiecewiseIncrementalCurve(c0, [0.0, 1.0e12], [c1])
+        elseif c2 == 0.0
+            function_data = LinearCurve(c1, c0)
         else
             p_limits = get_active_power_limits(comp)
             p_min = p_limits.min
