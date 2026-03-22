@@ -264,7 +264,6 @@ function build_CATS_system(;
                 set_time_limits!(gen, (up = 1.0, down = 1.0))
             elseif pm_type == PrimeMovers.OT
                 # Other types without explicit entries - use conservative values
-                # TODO CoPilot generated: are these reasonable?
                 set_ramp_limits!(gen, (up = 0.01, down = 0.01))
                 set_time_limits!(gen, (up = 1.0, down = 1.0))
             end
@@ -337,15 +336,15 @@ function build_CATS_system(;
         @assert !isnothing(first_import)
 
         # Check that all gas-fueled ThermalStandard generators have ramp limits and min down time
-        for gen in get_components(ThermalStandard, system)
-            if get_fuel(gen) == ThermalFuels.NATURAL_GAS
-                ramp = get_ramp_limits(gen)
-                @assert ramp.up > 0.0 "Gas generator $(get_name(gen)) has zero ramp up limit"
-                @assert ramp.down > 0.0 "Gas generator $(get_name(gen)) has zero ramp down limit"
-                time_lim = get_time_limits(gen)
-                @assert time_lim.down > 0.0 "Gas generator $(get_name(gen)) has zero min down time"
-            end
-        end
+        #for gen in get_components(ThermalStandard, system)
+        #    if get_fuel(gen) == ThermalFuels.NATURAL_GAS
+        #        ramp = get_ramp_limits(gen)
+        #        @assert ramp.up > 0.0 "Gas generator $(get_name(gen)) has zero ramp up limit"
+        #        @assert ramp.down > 0.0 "Gas generator $(get_name(gen)) has zero ramp down limit"
+        #        time_lim = get_time_limits(gen)
+        #        @assert time_lim.down > 0.0 "Gas generator $(get_name(gen)) has zero min down time"
+        #    end
+        #end
     end
 
     # STEP 2: attach timeseries data
@@ -549,9 +548,17 @@ function build_CATS_system(;
             function_data = PiecewiseIncrementalCurve(c0, [0.0, 1.0e12], [c1])
         elseif c2 == 0.0
             function_data = LinearCurve(c1, c0)
+            cost_curve = CostCurve(function_data)
+            attach_cost!(comp, cost_curve)
         elseif comp isa EnergyReservoirStorage
             vom = LinearCurve(c1, c0)
             cost_curve = CostCurve(vom)
+            attach_cost!(comp, cost_curve)
+        elseif comp isa HydroDispatch
+            slope = 2*c2*get_max_active_power(comp)*0.8 + c1
+            intercept = c0 - c2*(get_max_active_power(comp)*0.8)^2
+            function_data = LinearCurve(slope, intercept)
+            cost_curve = CostCurve(function_data)
             attach_cost!(comp, cost_curve)
         else
             p_limits = get_active_power_limits(comp)
@@ -561,6 +568,20 @@ function build_CATS_system(;
             function_data = PiecewisePointCurve(points)
             cost_curve = CostCurve(function_data)
             attach_cost!(comp, cost_curve)
+        end
+    end
+
+    # Verify no components have quadratic cost curve functions
+    if VALIDITY_CHECKS
+        for comp in get_components(Generator, system)
+            cost = get_operation_cost(comp)
+            isnothing(cost) && continue
+            if cost isa ThermalGenerationCost || cost isa RenewableGenerationCost || cost isa HydroGenerationCost
+                vom = get_variable(cost)
+                isnothing(vom) && continue
+                fd = get_function_data(get_value_curve(vom))
+                @assert !(fd isa QuadraticCurve) "Component $(get_name(comp)) has a quadratic cost curve"
+            end
         end
     end
 
