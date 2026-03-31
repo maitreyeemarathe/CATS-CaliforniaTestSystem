@@ -481,7 +481,7 @@ function build_CATS_system(;
 
             # Early skip for zero loads
             if isnothing(load)
-                @assert all(row_values .== 0.0)
+                @assert all(isapprox.(row_values, 0.0; atol=1e-6))
                 continue
             else
                 @assert get_number(get_bus(load)) == i "expected load $load_name to "*
@@ -526,15 +526,15 @@ function build_CATS_system(;
         gen_name = "gen-$(i)"
         comp = get_component(StaticInjection, system, gen_name)
         isnothing(comp) && continue  # skip removed components (e.g., SCs)
-        @assert row[:startup] == 0.0
-        @assert row[:shutdown] == 0.0
+        @assert isapprox(row[:startup], 0.0; atol=1e-6)
+        @assert isapprox(row[:shutdown], 0.0; atol=1e-6)
         n = row[:n]
         # assume quadratic cost function
         @assert n == 3 "Only quadratic cost functions supported."
         c2 = row[:c2]
         c1 = row[:c1]
         c0 = row[:c0]
-        if all((c2, c1, c0) .== 0.0)
+        if all(isapprox.((c2, c1, c0), 0.0; atol=1e-6))
             # cost is zero (SCs don't have an operation cost)
             (comp isa SynchronousCondenser || comp isa FixedAdmittance) || attach_cost!(comp, nothing)
             continue
@@ -546,7 +546,7 @@ function build_CATS_system(;
             # FIXME they use negative exports to represent imports, whereas we use
             # separate curves...
             function_data = PiecewiseIncrementalCurve(c0, [0.0, 1.0e12], [c1])
-        elseif c2 == 0.0
+        elseif isapprox(c2, 0.0; atol=1e-6)
             function_data = LinearCurve(c1, c0)
             cost_curve = CostCurve(function_data)
             attach_cost!(comp, cost_curve)
