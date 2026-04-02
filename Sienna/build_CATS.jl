@@ -488,26 +488,34 @@ function build_CATS_system(;
                     "be at bus $i, got bus $(get_number(get_bus(load)))"
             end
 
-            real_values = real.(row_values)
-            @assert all(real_values .>= 0.0) "Negative real values found for load $load_name"
-            max_ts = maximum(real_values)
+            active_power = real.(row_values)
+            reactive_power = imag.(row_values)
+            @assert all(active_power .>= 0.0) "Negative real values found for load $load_name"
+            max_ts = maximum(active_power)
 
             if max_ts > get_max_active_power(load)
                 increased += 1
                 most_increase = max(most_increase, max_ts / get_max_active_power(load))
                 set_max_active_power!(load, max_ts)
             end
-            @assert all(real_values .<= get_max_active_power(load) + 1e-6)
+            @assert all(active_power .<= get_max_active_power(load) + 1e-6)
 
             # PSI prefers values to be between 0 and 1.
-            real_values ./= get_max_active_power(load)
+            active_power ./= get_max_active_power(load)
+            reactive_power ./= get_max_active_power(load)
 
-            ts = SingleTimeSeries(;
+            ts_p = SingleTimeSeries(;
                 name = "max_active_power",
-                data = TimeArray(timestamps, real_values),
+                data = TimeArray(timestamps, active_power),
                 scaling_factor_multiplier = get_max_active_power,
             )
-            add_time_series!(system, load, ts)
+            ts_q = SingleTimeSeries(;
+                name = "reactive_power",
+                data = TimeArray(timestamps, reactive_power),
+                scaling_factor_multiplier = get_max_active_power,
+            )
+            add_time_series!(system, load, ts_p)
+            add_time_series!(system, load, ts_q)
         end
         if increased > 0
             num_loads = length(get_components(PowerLoad, system))
