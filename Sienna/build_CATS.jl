@@ -491,31 +491,28 @@ function build_CATS_system(;
             active_power = real.(row_values)
             reactive_power = imag.(row_values)
             @assert all(active_power .>= 0.0) "Negative real values found for load $load_name"
-            max_ts = maximum(active_power)
 
-            if max_ts > get_max_active_power(load)
-                increased += 1
-                most_increase = max(most_increase, max_ts / get_max_active_power(load))
-                set_max_active_power!(load, max_ts)
+            power_configs = (
+                (active_power, "max_active_power", get_max_active_power, set_max_active_power!),
+                (abs.(reactive_power), "reactive_power", get_max_reactive_power, set_max_reactive_power!),
+            )
+
+            for (power_values, ts_name, get_max_fn, set_max_fn!) in power_configs
+                max_power = maximum(power_values)
+                if max_power > get_max_fn(load)
+                    increased += 1
+                    most_increase = max(most_increase, max_power / get_max_fn(load))
+                    set_max_fn!(load, max_power)
+                end
+                # PSI prefers values to be between 0 and 1.
+                power_values ./= get_max_fn(load)
+                ts = SingleTimeSeries(;
+                    name = ts_name,
+                    data = TimeArray(timestamps, power_values),
+                    scaling_factor_multiplier = get_max_fn,
+                )
+                add_time_series!(system, load, ts)
             end
-            @assert all(active_power .<= get_max_active_power(load) + 1e-6)
-
-            # PSI prefers values to be between 0 and 1.
-            active_power ./= get_max_active_power(load)
-            reactive_power ./= get_max_active_power(load)
-
-            ts_p = SingleTimeSeries(;
-                name = "max_active_power",
-                data = TimeArray(timestamps, active_power),
-                scaling_factor_multiplier = get_max_active_power,
-            )
-            ts_q = SingleTimeSeries(;
-                name = "reactive_power",
-                data = TimeArray(timestamps, reactive_power),
-                scaling_factor_multiplier = get_max_active_power,
-            )
-            add_time_series!(system, load, ts_p)
-            add_time_series!(system, load, ts_q)
         end
         if increased > 0
             num_loads = length(get_components(PowerLoad, system))
