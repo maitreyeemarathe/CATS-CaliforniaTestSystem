@@ -5,6 +5,12 @@ using Dates
 using TimeSeries
 using JLD2
 using JSON
+using Random
+
+function _draw_storage_efficiency()
+    # Uniform in [0.92, 0.98] (0.95 ± 3%), rounded to 2 significant figures.
+    return round(0.92 + 0.06 * rand(), digits=2)
+end
 
 const PSY = PowerSystems
 
@@ -130,6 +136,8 @@ function convert_to_battery(system::System,
     p_limits = (min = 0.0, max = k_p*rating)
     set_input_active_power_limits!(battery_gen, p_limits)
     set_output_active_power_limits!(battery_gen, p_limits)
+    η = _draw_storage_efficiency()
+    set_efficiency!(battery_gen, (in = η, out = η))
     # reactive power: initial 0.0, limits (-k_q * rating, k_q * rating)
     if k_q !== nothing
         q_limits = (min = -k_q*rating, max = k_q*rating)
