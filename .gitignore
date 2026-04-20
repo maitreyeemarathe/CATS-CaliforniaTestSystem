@@ -7,4 +7,6 @@
 solutions/
 
 # Large files
-data/
+data/*
+!data/scs*.csv
+!data/fixed_admittance_candidates.csv
