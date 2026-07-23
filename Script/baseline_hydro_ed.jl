@@ -16,11 +16,14 @@ using PowerFlows
 import PowerNetworkMatrices: VirtualPTDF
 using TimeSeries
 using XLSX
-HYDRO_DATA_DIR = "$(homedir())/Documents/GitHub/CATS-CaliforniaTestSystem/hydro_data/"
-RESULTS_DIR = "$(homedir())/Documents/GitHub/CATS-CaliforniaTestSystem/results/baseline/"
+using Plots
 
 
-CATS_DIR = "$(homedir())/Documents/GitHub/CATS-CaliforniaTestSystem/Sienna/"
+BASE_DIR = joinpath(@__DIR__, "..")
+HYDRO_DATA_DIR = "$BASE_DIR/hydro_data/"
+RESULTS_DIR = "$BASE_DIR/results/baseline/"
+CATS_DIR = "$BASE_DIR/Sienna/"
+
 include(joinpath(CATS_DIR, "baseline_build_CATS_modified.jl"))
 
 # Find selected hydro units and assign budget
@@ -330,7 +333,65 @@ CSV.write(joinpath(RESULTS_DIR, "hydro_ed_revenue_by_generator.csv"), by_gen)
 CSV.write(joinpath(RESULTS_DIR, "hydro_ed_revenue_by_plant.csv"), by_plant) 
 
 
+# Write price per timestep to a CSV file
+price_usd_per_mwh_df = copy(price_df)
+price_usd_per_mwh_df.value ./= get_base_power(system)  # convert from $/100 MWh to $/MWh
+CSV.write(joinpath(RESULTS_DIR, "hydro_ed_prices.csv"), price_usd_per_mwh_df)  # convert from $/100 MWh to $/MWh
 
+# Get maximum dispatch bounds for hydro plants
+hydro_max_param_dict = read_parameter(ed_results, "ActivePowerTimeSeriesParameter__HydroDispatch")
+hydro_min_param_dict = read_parameter(ed_results, "MinActivePowerTimeSeriesParameter__HydroDispatch")
+
+# Convert SortedDict to DataFrame
+hydro_max_param = vcat([
+    begin
+        x = copy(df)
+        if :DateTime ∉ names(x)
+            x.DateTime = fill(dt, nrow(x))
+        end
+        x
+    end
+    for (dt, df) in pairs(hydro_max_param_dict)
+]...)
+hydro_min_param = vcat([
+    begin
+        x = copy(df)
+        if :DateTime ∉ names(x)
+            x.DateTime = fill(dt, nrow(x))
+        end
+        x
+    end
+    for (dt, df) in pairs(hydro_min_param_dict)
+]...)
+
+# Plot system price and dispatch for each plant in a single figure
+system_price = combine(groupby(rev_df, :DateTime), :price => first => :price)  # Price is identical per DateTime
+p_price = plot(system_price.DateTime, (system_price.price)/100; label="System Price (USD/MWh)", color=:red, xlabel="", ylabel="USD/MWh", title="System Energy Price", legend=:topright)
+
+# Create plant dispatch plots
+plant_plots = []
+for (plant, (_, gens)) in selected_hydro_details
+    plant_df = filter(row -> row.gen_name in gens, rev_df)
+    plant_dispatch = combine(groupby(plant_df, :DateTime), :mw => sum => :total_mw)
+    
+    # Aggregate max bounds by plant
+    plant_max = filter(row -> row[:name] in gens, hydro_max_param)
+    plant_max_agg = combine(groupby(plant_max, :DateTime), :value => sum => :max_mw)
+    # Aggregate min bounds by plant
+    plant_min = filter(row -> row[:name] in gens, hydro_min_param)
+    plant_min_agg = combine(groupby(plant_min, :DateTime), :value => sum => :min_mw)
+    # Create plot with dispatch and bounds
+    p = plot(plant_dispatch.DateTime, plant_dispatch.total_mw; label="Dispatch (MW)", color=:blue, lw=2, xlabel="", ylabel="MW", title="Dispatch for $(plant)", legend=:topright)
+    plot!(p, plant_max_agg.DateTime, plant_max_agg.max_mw; label="Maximum (MW)", color=:red, ls=:dash, lw=1.5)
+    plot!(p, plant_min_agg.DateTime, plant_min_agg.min_mw; label="Minimum (MW)", color=:green, ls=:dash, lw=1.5)
+    push!(plant_plots, p)
+end
+
+# Combine all plots into a single figure
+fig = plot(p_price, plant_plots...; layout=(5, 1), link=:x, size=(1500, 1500), dpi=150,
+    left_margin=8Plots.mm, bottom_margin=10Plots.mm, right_margin=8Plots.mm)
+display(fig)
+savefig(fig, joinpath(RESULTS_DIR, "hydro_dispatch_price_combined.png"))
 
 #model = SimulationModels(;decision_model = problem)
 

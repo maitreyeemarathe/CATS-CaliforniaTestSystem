@@ -89,7 +89,8 @@ function generate_offer_curve(
     for i in 1:horizon_len
         p_star = clamp(Float64(optimal_power_values_MW[i]), Float64(min_mw_vals[i]), Float64(max_mw_vals[i]))
         hourly_bids[i] = PiecewiseStepData(
-            [0.0, p_star/component_max_mw, component_max_mw/component_max_mw],
+            #[0.0, p_star/component_max_mw, component_max_mw/component_max_mw],
+            [0.0, p_star, component_max_mw],
             [0.0, 1000],
         )
         if get_name(comp) == "gen-297"

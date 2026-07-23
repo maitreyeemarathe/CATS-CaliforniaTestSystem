@@ -554,8 +554,8 @@ function build_CATS_system(;
             #CSV.write(debug_csv_path, DataFrame(timestamp=timestamps, min_active_power=unit_min_hourly))
             ts_min = SingleTimeSeries(;
                 name = "min_active_power",
-                #data = TimeArray(timestamps, unit_min_normalized),
-                data = TimeArray(timestamps, zeros(length(timestamps))),  # For now keep it at zero
+                data = TimeArray(timestamps, unit_min_normalized),
+                #data = TimeArray(timestamps, zeros(length(timestamps))),  # For now keep it at zero
                 scaling_factor_multiplier = get_max_active_power,
             )
             bulk_add_time_series!(system, [TimeSeriesAssociation(comp, ts_min)])
@@ -695,6 +695,12 @@ function build_CATS_system(;
             cost_curve = CostCurve(vom)
             attach_cost!(comp, cost_curve)
         elseif comp isa HydroDispatch
+            slope = 1
+            intercept = 0
+            function_data = LinearCurve(slope, intercept)
+            cost_curve = CostCurve(function_data)
+            attach_cost!(comp, cost_curve)  
+            #=
             if get_name(comp) in selected_gen_names
                 #println("$(get_name(comp))'s coefficients are $(c2), $(c1), $(c0)")
                 #attach_cost!(comp, nothing)
@@ -705,6 +711,7 @@ function build_CATS_system(;
                 cost_curve = CostCurve(function_data)
                 attach_cost!(comp, cost_curve)
             end
+            =#
         else
             p_limits = get_active_power_limits(comp)
             p_min = p_limits.min

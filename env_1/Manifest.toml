@@ -2114,7 +2114,7 @@ uuid = "c4b69c83-5512-53e3-94e6-de98773c479f"
 version = "1.4.2+0"
 
 [[deps.env_1]]
-deps = ["CSV", "DataFrames", "Dates", "HiGHS", "HydroPowerSimulations", "InfrastructureSystems", "JLD2", "JSON", "JuMP", "Plots", "PowerFlows", "PowerNetworkMatrices", "PowerSimulations", "PowerSystemCaseBuilder", "PowerSystems", "Random", "Statistics", "TimeSeries", "XLSX"]
+deps = ["CSV", "DataFrames", "Dates", "HiGHS", "HydroPowerSimulations", "InfrastructureSystems", "JLD2", "JSON", "JuMP", "Plots", "PowerFlows", "PowerNetworkMatrices", "PowerSimulations", "PowerSystemCaseBuilder", "PowerSystems", "Random", "Statistics", "TimeSeries", "XLSX", "Xpress"]
 path = "."
 uuid = "baad5f91-58fd-4fe4-857d-0fa9d61ef7c9"
 version = "0.1.0"
