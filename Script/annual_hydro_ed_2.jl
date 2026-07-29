@@ -22,11 +22,11 @@ using Plots
 
 BASE_DIR = joinpath(@__DIR__, "..")
 HYDRO_DATA_DIR = "$BASE_DIR/hydro_data/"
-RESULTS_DIR = "$BASE_DIR/results/ed/"
+RESULTS_DIR = "$BASE_DIR/results/annual_ed_2/"
 CATS_DIR = "$BASE_DIR/Sienna/"
 
 include(joinpath(CATS_DIR, "build_CATS_modified.jl"))
-include(joinpath(dirname(@__FILE__), "greedy_dispatch_ed.jl"))
+include(joinpath(dirname(@__FILE__), "annual_greedy_dispatch_ed_2.jl"))
 
 
 # Find selected hydro units and assign budget
@@ -106,381 +106,321 @@ end
 
 
 
+
+
 # Choose the week to solve.
 # Example: week starting Monday 2019-07-01 00:00.
-start_time = DateTime("2019-03-19T00:00:00")
-horizon_hours = Hour(1)
-model_interval = Hour(1)
+horizon_hours_int = Int(24)
+horizon_hours = Hour(horizon_hours_int)
+model_interval = Hour(24)
+sim_steps = Int(1)  
 
-# Calculate weekly budget for each selected hydro unit by summing the hourly budget values over the week starting at start_time.
-weekly_budget_mwh_by_name = Dict{String, Float64}()
-for comp in get_components(HydroDispatch, system)
-    if get_name(comp) in selected_gen_names
-        budget_ts = get_time_series(SingleTimeSeries, comp, "hydro_budget")
-        budget_vals = get_time_series_values(
-            comp,
-            budget_ts;
-            start_time = start_time,
-            len = 7 * 24,
-        )
-        weekly_budget_mwh = sum(budget_vals)
-        println("Weekly budget for hydro unit $(get_name(comp)) over the week starting at $(start_time): $(weekly_budget_mwh) MWh")
-        weekly_budget_mwh_by_name[get_name(comp)] = weekly_budget_mwh
-    end
-end
+# Make a variable for total plant-wise revenue/profit 
+revenue_by_plant = Dict{String, Float64}()
+# Make a variable for hydro dispatch across all timesteps
+hydro_dispatch_accumulated = DataFrame()
+# Make a variable for hydro budget usage across all timesteps
+hydro_budget_usage_accumulated = DataFrame()
 
 
-# Find if there is any hydro unit such that the sum of min_active_power over the week starting at start_time exceeds the weekly budget. If so, print a warning.
-for comp in get_components(HydroDispatch, system)
-    if get_name(comp) in selected_gen_names
-        min_ts = get_time_series(SingleTimeSeries, comp, "min_active_power")
-        min_vals = get_time_series_values(
-            comp,
-            min_ts;
-            start_time = start_time,
-            len = 7 * 24,
-        )
-        weekly_min_mwh = sum(min_vals)
-        if weekly_min_mwh > weekly_budget_mwh_by_name[get_name(comp)]
-            println("Warning: Hydro unit ", get_name(comp), " has weekly minimum generation (", weekly_min_mwh, " MWh) exceeding its weekly budget (", weekly_budget_mwh_by_name[get_name(comp)], " MWh).")
-        end
-    end
-end
+# Make a deepcopy of the system and solve for multiple timesteps
+for i in 1:Int(52*7)
+    start_time = DateTime("2019-01-01T00:00:00") + (i-1)*horizon_hours
+    system_copy = deepcopy(system)
 
-
-println("Solving for week starting at ", start_time)
-offer_curve_by_name = Dict{String, SingleTimeSeries}()
-for comp in get_components(HydroDispatch, system)
-    if get_name(comp) in selected_gen_names 
-        offer_curves = generate_offer_curve(
+    println("Day $(i)")
+    # Calculate total budget for each selected hydro unit by summing the hourly budget values over the horizon starting at start_time.
+    total_budget_mwh_by_name = Dict{String, Float64}()
+    for comp in get_components(HydroDispatch, system_copy)
+        if get_name(comp) in selected_gen_names
+            budget_ts = get_time_series(SingleTimeSeries, comp, "hydro_budget")
+            budget_vals = get_time_series_values(
                 comp,
-                start_time,
-                Hour(7*24);
-                leftover_budget_by_name = weekly_budget_mwh_by_name,
+                budget_ts;
+                start_time = start_time,
+                len = sim_steps*horizon_hours_int,
             )
-        offer_curve_by_name[get_name(comp)] = offer_curves
-        set_variable_cost!(system, comp, offer_curves, UnitSystem.NATURAL_UNITS)
-        ts_max = get_time_series(SingleTimeSeries, comp, "max_active_power")
-        max_ta = get_data(ts_max)
-        initial_input_ts = SingleTimeSeries(
-            ;
-            name = "incremental_initial_input",
-            data = TimeArray(timestamp(max_ta), zeros(Float64, length(timestamp(max_ta)))),
-        )
-        set_incremental_initial_input!(system, comp, initial_input_ts)
-        # Debugging: print the offer curve at the start_time for this hydro unit.
-        #=
-        if get_name(comp) == "gen-297"
-            offer_data = get_data(offer_curves)  # TimeArray{PiecewiseStepData,...}
-
-            ts = timestamp(offer_data)
-            i0 = findfirst(==(start_time), ts)
-            @assert i0 !== nothing "start_time $(start_time) not found in offer_data timestamps"
-
-            vals = TimeSeries.values(offer_data)
-            first_at_start = ndims(vals) == 1 ? vals[i0] : vals[i0, 1]
-
-            #println("offer_data at start_time ($(ts[i0])): ", first_at_start)
+            total_budget_mwh = sum(budget_vals)
+            #println("Total budget for hydro unit $(get_name(comp)) over the horizon starting at $(start_time): $(total_budget_mwh) MWh")
+            total_budget_mwh_by_name[get_name(comp)] = total_budget_mwh
         end
-        =#
-    end   
-end
+    end
 
-
-transform_single_time_series!(
-        system,
-        horizon_hours,  # horizon
-        model_interval,   # interval (daily rolling windows)
-    );
-
-template = ProblemTemplate(NetworkModel(CopperPlatePowerModel; use_slacks=false, duals=[CopperPlateBalanceConstraint]))
-
-set_device_model!(template, ThermalStandard, ThermalBasicDispatch)
-set_device_model!(template, RenewableDispatch, RenewableFullDispatch)
-set_device_model!(template, HydroDispatch, HydroDispatchRunOfRiver)
-set_device_model!(template, PowerLoad, StaticPowerLoad)
-set_device_model!(template, Line, StaticBranch)
-set_device_model!(template, Transformer2W, StaticBranch)
- 
-solver_highs = JuMP.optimizer_with_attributes(HiGHS.Optimizer) 
-#solver_xpress = JuMP.optimizer_with_attributes(Xpress.Optimizer)
-
-problem = DecisionModel(
-    template,
-    system;
-    optimizer=solver_highs,
-    optimizer_solve_log_print=true,
-    calculate_conflict=true,
-    horizon = horizon_hours,
-    interval = model_interval,
-    initial_time = start_time,
-    name="ED",
-    store_variable_names = true
-)
-
-    
-model = SimulationModels(;decision_models = problem)
-sequence = SimulationSequence(;
-    models = model,
-    ini_cond_chronology = InterProblemChronology(),
-)
-sim = Simulation(;
-    name = "cats_hydro_ed",
-    steps = 168,
-    models = model,
-    sequence = sequence,
-    simulation_folder = RESULTS_DIR,
-    initial_time=start_time
-)
-build!(sim)
-execute!(sim)
-results = SimulationResults(sim)
-
-ed_results = get_decision_problem_results(results, "ED")
-
-# Compute revenue/profit for selected hydro units in ED
-ved = read_variables(ed_results)
-ded = read_duals(ed_results)
-
-# Write dispatch of all generators to XLSX for external analysis. Make a new sheet for each timestep
-dispatch_hydro = read_variable(ed_results, "ActivePowerVariable__HydroDispatch")
-dispatch_thermal = read_variable(ed_results, "ActivePowerVariable__ThermalStandard")
-dispatch_renewable = read_variable(ed_results, "ActivePowerVariable__RenewableDispatch")
-dispatch_tables = [dispatch_hydro, dispatch_thermal, dispatch_renewable]
-#for sd in (dispatch_hydro, dispatch_thermal, dispatch_renewable)
-#    for dt in keys(sd)
-#        sd[dt][!, :value] .*= get_base_power(system)  # Convert from per-unit to MW
-#    end
-#end
-dispatch_xlsx_path = joinpath(RESULTS_DIR, "ed_dispatch_all_generators_by_timestep.xlsx")
-dispatch_timesteps = sort(unique(vcat([collect(keys(sd)) for sd in dispatch_tables]...)))
-
-XLSX.openxlsx(dispatch_xlsx_path, mode = "w") do xf
-    for (i, dt) in enumerate(dispatch_timesteps)
-        dfs = DataFrame[]
-        for sd in dispatch_tables
-            if haskey(sd, dt)
-                push!(dfs, copy(sd[dt]))
+    # Find if there is any hydro unit such that the sum of min_active_power over the horizon starting at start_time exceeds the total budget. If so, print a warning.
+    for comp in get_components(HydroDispatch, system_copy)
+        if get_name(comp) in selected_gen_names
+            min_ts = get_time_series(SingleTimeSeries, comp, "min_active_power")
+            min_vals = get_time_series_values(
+                comp,
+                min_ts;
+                start_time = start_time,
+                len = sim_steps*horizon_hours_int,
+            )
+            total_min_mwh = sum(min_vals)
+            if total_min_mwh > total_budget_mwh_by_name[get_name(comp)]
+                println("Warning: Hydro unit ", get_name(comp), " has minimum generation (", total_min_mwh, " MWh) exceeding its total budget (", total_budget_mwh_by_name[get_name(comp)], " MWh).")
             end
         end
-        sdf = isempty(dfs) ? DataFrame() : vcat(dfs...)
-        if :DateTime ∉ names(sdf)
-            sdf.DateTime = fill(dt, nrow(sdf))
-        end
-        if :value in names(sdf)
-            sort!(sdf, :value, rev = true)
-        end
-
-        sheet_name = "t" * lpad(string(i), 3, '0') * "_" * Dates.format(dt, "yyyymmdd_HHMM")
-        sheet = if i == 1
-            XLSX.renamesheet!(xf[1], sheet_name)
-            xf[1]
-        else
-            XLSX.addsheet!(xf, sheet_name)
-        end
-
-        columns = [sdf[!, c] for c in names(sdf)]
-        XLSX.writetable!(sheet, columns, String.(names(sdf)); write_columnnames = true)
     end
-end
 
-println("Wrote all-generator dispatch workbook: $(dispatch_xlsx_path)")
+    offer_curve_by_name = Dict{String, SingleTimeSeries}()
+    for comp in get_components(HydroDispatch, system_copy)
+        if get_name(comp) in selected_gen_names 
+            offer_curves = generate_offer_curve(
+                    comp,
+                    start_time,
+                    Hour(sim_steps*horizon_hours_int);
+                    leftover_budget_by_name = total_budget_mwh_by_name,
+                    forecast_perfect = false,
+                    day = i
+                )
+            offer_curve_by_name[get_name(comp)] = offer_curves
+            set_variable_cost!(system_copy, comp, offer_curves, UnitSystem.NATURAL_UNITS)
+            ts_max = get_time_series(SingleTimeSeries, comp, "max_active_power")
+            max_ta = get_data(ts_max)
+            initial_input_ts = SingleTimeSeries(
+                ;
+                name = "incremental_initial_input",
+                data = TimeArray(timestamp(max_ta), zeros(Float64, length(timestamp(max_ta)))),
+            )
+            set_incremental_initial_input!(system_copy, comp, initial_input_ts)
+        end   
+    end
 
-# Write the dispatch of all selected hydro units to a CSV file for external analysis.
-hydro_dispatch_timesteps = sort(collect(keys(dispatch_hydro)))
-hydro_name_col = :name
+    transform_single_time_series!(
+            system_copy,
+            horizon_hours,  # horizon
+            model_interval,   # interval (daily rolling windows)
+        );
 
-hydro_dispatch_wide = DataFrame(DateTime = hydro_dispatch_timesteps)
-for gen_name in sort(collect(selected_gen_names))
-    hydro_dispatch_wide[!, gen_name] = [
-        begin
-            df = dispatch_hydro[dt]
-            idx = findfirst(==(gen_name), df[!, hydro_name_col])
-            idx === nothing ? NaN : Float64(df[idx, :value])
-        end
-        for dt in hydro_dispatch_timesteps
-    ]
-end
+    template = ProblemTemplate(NetworkModel(CopperPlatePowerModel; use_slacks=false, duals=[CopperPlateBalanceConstraint]))
 
-CSV.write(
-    joinpath(RESULTS_DIR, "selected_hydro_dispatch_wide.csv"),
-    hydro_dispatch_wide,
-)
+    set_device_model!(template, ThermalStandard, ThermalBasicDispatch)
+    set_device_model!(template, RenewableDispatch, RenewableFullDispatch)
+    set_device_model!(template, HydroDispatch, HydroDispatchRunOfRiver)
+    set_device_model!(template, PowerLoad, StaticPowerLoad)
+    set_device_model!(template, Line, StaticBranch)
+    set_device_model!(template, Transformer2W, StaticBranch)
+ 
+    solver_highs = JuMP.optimizer_with_attributes(HiGHS.Optimizer, "output_flag" => false,) 
 
-# Write the percentage of weekly budget used for each selected hydro unit to a CSV file
-budget_usage_df = DataFrame(name = String[], budget_used_pct = Float64[])
-for gen_name in sort(collect(selected_gen_names))
-    total_dispatch_mwh = sum(
-        begin
-            df = dispatch_hydro[dt]
-            idx = findfirst(==(gen_name), df[!, hydro_name_col])
-            idx === nothing ? 0.0 : Float64(df[idx, :value])
-        end
-        for dt in hydro_dispatch_timesteps
+    problem = DecisionModel(
+        template,
+        system_copy;
+        optimizer=solver_highs,
+        optimizer_solve_log_print=false,
+        calculate_conflict=false,
+        #rebuild_model = true,
+        horizon = horizon_hours,
+        interval = model_interval,
+        initial_time = start_time,
+        name="ED",
+        store_variable_names = true
     )
-    total_budget_mwh = weekly_budget_mwh_by_name[gen_name]
-    budget_used_pct = total_budget_mwh > 0 ? 100 * total_dispatch_mwh / total_budget_mwh : NaN
-    println(
-        "Weekly budget used for hydro unit ",
-        gen_name,
-        ": ",
-        budget_used_pct,
-        "% (",
-        total_dispatch_mwh,
-        " MWh / ",
-        total_budget_mwh,
-        " MWh)",
-    )
-    push!(budget_usage_df, (name = gen_name, budget_used_pct = budget_used_pct))
-end
 
-CSV.write(
-    joinpath(RESULTS_DIR, "hydro_budget_usage_pct.csv"),
-    budget_usage_df,
-)
-
-
-# Computing revenue
-
-# Find ED hydro dispatch and ED energy price tables
-hydro_key = only([k for k in keys(ved) if occursin("ActivePowerVariable", String(k)) && occursin("HydroDispatch", String(k))])
-price_key = only([k for k in keys(ded) if occursin("CopperPlateBalanceConstraint", String(k))])
-
-
-hydro_sd = ved[hydro_key]   # SortedDict{DateTime, DataFrame}
-price_sd = ded[price_key]   # SortedDict{DateTime, DataFrame}
-
-# Flatten SortedDict -> one DataFrame (attach DateTime if missing)
-to_df(sd) = vcat([
-    begin
-        x = copy(df)
-        if :DateTime ∉ names(x)
-            x.DateTime = fill(dt, nrow(x))
-        end
-        x
-    end
-    for (dt, df) in pairs(sd)
-]...)
-
-hydro_df = to_df(hydro_sd)
-# multiply by base power to convert from per-unit to MW
-#hydro_df.value .*= get_base_power(system)
-price_df = to_df(price_sd)
-
-comp_col = :component_name in names(hydro_df) ? :component_name : :name
-
-# Keep only selected hydro generators
-hydro_df = filter(row -> row[comp_col] in selected_gen_names, hydro_df)
-
-# Join dispatch with price
-rev_df = innerjoin(
-    select(hydro_df, :DateTime, comp_col, :value),
-    select(price_df, :DateTime, :value),
-    on = :DateTime,
-    makeunique = true,
-)
-
-DataFrames.rename!(rev_df, comp_col => :gen_name, :value => :mw, :value_1 => :price)
-
-# 1-hour ED resolution => MWh = MW
-rev_df.energy_mwh = rev_df.mw
-rev_df.revenue = rev_df.energy_mwh .* rev_df.price/100 # price is in $ per 100 MWh, so divide by 100 to get $ per MWh
-# TODO: Assign cost, assuming zero for now
-rev_df.production_cost = zeros(nrow(rev_df))   # or: fill(0.0, nrow(rev_df))
-rev_df.profit = rev_df.revenue .- rev_df.production_cost
-
-# Map generator -> plant
-gen_to_plant = Dict(g => plant for (plant, (_, gens)) in selected_hydro_details for g in gens)
-rev_df.plant = [get(gen_to_plant, g, "UNKNOWN") for g in rev_df.gen_name]
-
-# Summaries
-by_gen = combine(groupby(rev_df, :gen_name),
-    :energy_mwh => sum => :energy_mwh,
-    :revenue => sum => :revenue,
-    :profit => sum => :profit,
-)
-
-by_plant = combine(groupby(rev_df, :plant),
-    :energy_mwh => sum => :energy_mwh,
-    :revenue => sum => :revenue,
-    :profit => sum => :profit,
-)
-
-println("\n=== Selected Hydro ED Revenue by Generator ===")
-show(by_gen, allrows=true, allcols=true); println()
-
-println("\n=== Selected Hydro ED Revenue by Plant ===")
-show(by_plant, allrows=true, allcols=true); println()
-
-println("\nTotal selected hydro ED revenue = \$$(round(sum(by_plant.revenue), digits=2))")
-println("Total selected hydro ED profit  = \$$(round(sum(by_plant.profit), digits=2))")
-
-# Write revenue/profit summaries to CSV
-CSV.write(joinpath(RESULTS_DIR, "hydro_ed_revenue_by_generator.csv"), by_gen)
-CSV.write(joinpath(RESULTS_DIR, "hydro_ed_revenue_by_plant.csv"), by_plant) 
-
-
-# Write price per timestep to a CSV file
-# Divide the value column of price_df by get_base_power(system) to convert from $/100 MWh to $/MWh
-
-price_usd_per_mwh_df = copy(price_df)
-price_usd_per_mwh_df.value ./= get_base_power(system)  # convert from $/100 MWh to $/MWh
-CSV.write(joinpath(RESULTS_DIR, "hydro_ed_prices.csv"), price_usd_per_mwh_df)  # convert from $/100 MWh to $/MWh
-
-# Get maximum dispatch bounds for hydro plants
-hydro_max_param_dict = read_parameter(ed_results, "ActivePowerTimeSeriesParameter__HydroDispatch")
-hydro_min_param_dict = read_parameter(ed_results, "MinActivePowerTimeSeriesParameter__HydroDispatch")
-
-# Convert SortedDict to DataFrame
-hydro_max_param = vcat([
-    begin
-        x = copy(df)
-        if :DateTime ∉ names(x)
-            x.DateTime = fill(dt, nrow(x))
-        end
-        x
-    end
-    for (dt, df) in pairs(hydro_max_param_dict)
-]...)
-hydro_min_param = vcat([
-    begin
-        x = copy(df)
-        if :DateTime ∉ names(x)
-            x.DateTime = fill(dt, nrow(x))
-        end
-        x
-    end
-    for (dt, df) in pairs(hydro_min_param_dict)
-]...)
-
-# Plot system price and dispatch for each plant in a single figure
-system_price = combine(groupby(rev_df, :DateTime), :price => first => :price)  # Price is identical per DateTime
-p_price = plot(system_price.DateTime, (system_price.price)/100; label="System Price (USD/MWh)", color=:red, xlabel="", ylabel="USD/MWh", title="System Energy Price", legend=:topright)
-
-# Create plant dispatch plots
-plant_plots = []
-for (plant, (_, gens)) in selected_hydro_details
-    plant_df = filter(row -> row.gen_name in gens, rev_df)
-    plant_dispatch = combine(groupby(plant_df, :DateTime), :mw => sum => :total_mw)
     
-    # Aggregate max bounds by plant
-    plant_max = filter(row -> row[:name] in gens, hydro_max_param)
-    plant_max_agg = combine(groupby(plant_max, :DateTime), :value => sum => :max_mw)
-    # Aggregate min bounds by plant
-    plant_min = filter(row -> row[:name] in gens, hydro_min_param)
-    plant_min_agg = combine(groupby(plant_min, :DateTime), :value => sum => :min_mw)
-    # Create plot with dispatch and bounds
-    p = plot(plant_dispatch.DateTime, plant_dispatch.total_mw; label="Dispatch (MW)", color=:blue, lw=2, xlabel="", ylabel="MW", title="Dispatch for $(plant)", legend=:topright)
-    plot!(p, plant_max_agg.DateTime, plant_max_agg.max_mw; label="Maximum (MW)", color=:red, ls=:dash, lw=1.5)
-    plot!(p, plant_min_agg.DateTime, plant_min_agg.min_mw; label="Minimum (MW)", color=:green, ls=:dash, lw=1.5)
-    push!(plant_plots, p)
+    model = SimulationModels(;decision_models = problem)
+    sequence = SimulationSequence(;
+        models = model,
+        ini_cond_chronology = InterProblemChronology(),
+    )
+    sim = Simulation(;
+        name = "cats_hydro_ed",
+        steps = sim_steps,
+        models = model,
+        sequence = sequence,
+        simulation_folder = RESULTS_DIR,
+        initial_time=start_time
+    )
+    build!(sim)
+    execute!(sim)
+    results = SimulationResults(sim)
+
+    ed_results = get_decision_problem_results(results, "ED")
+
+    # Compute revenue/profit for selected hydro units in ED
+    ved = read_variables(ed_results)
+    ded = read_duals(ed_results)
+
+    # Write dispatch of all generators to XLSX for external analysis. Make a new sheet for each timestep
+    dispatch_hydro = read_variable(ed_results, "ActivePowerVariable__HydroDispatch")
+    #dispatch_thermal = read_variable(ed_results, "ActivePowerVariable__ThermalStandard")
+    #dispatch_renewable = read_variable(ed_results, "ActivePowerVariable__RenewableDispatch")
+    #dispatch_tables = [dispatch_hydro, dispatch_thermal, dispatch_renewable]
+
+    # Write the dispatch of all selected hydro units to a CSV file for external analysis.
+    #hydro_dispatch_timesteps = sort(unique(vcat([DateTime.(df[!, :DateTime]) for df in values(dispatch_hydro)]...)))
+
+    # Name column used to identify generators in dispatch tables.
+    hydro_name_col = :name
+
+    # 1) Build one long table from all simulation-step DataFrames.
+    # Each DataFrame already contains row-level DateTime values.
+    hydro_long = vcat([copy(df) for df in values(dispatch_hydro)]...)
+
+    # 2) Keep only generators we care about.
+    hydro_long = filter(row -> row[hydro_name_col] in selected_gen_names, hydro_long)
+
+    # 3) Pivot to wide format:
+    #    rows   -> DateTime
+    #    cols   -> generator name
+    #    values -> dispatch MW
+    hydro_dispatch_wide = unstack(
+        hydro_long,
+        :DateTime,
+        hydro_name_col,
+        :value;
+        combine = first,  # safe if a (DateTime, gen) appears once
+    )
+
+    # 4) Sort by time so output is chronological.
+    sort!(hydro_dispatch_wide, :DateTime)
+
+    # 5) Ensure every selected generator has a column, and replace missing with NaN.
+    ordered_gens = sort(collect(selected_gen_names))
+    for gen_name in ordered_gens
+        if !(gen_name in names(hydro_dispatch_wide))
+            hydro_dispatch_wide[!, gen_name] = fill(NaN, nrow(hydro_dispatch_wide))
+        else
+            hydro_dispatch_wide[!, gen_name] = coalesce.(hydro_dispatch_wide[!, gen_name], NaN)
+        end
+    end
+
+    # 6) Keep columns in a clean order: DateTime first, then sorted generator names.
+    select!(hydro_dispatch_wide, Cols(:DateTime, ordered_gens...))
+
+    # Accumulate dispatch across iterations and write once after the loop.
+    append!(hydro_dispatch_accumulated, hydro_dispatch_wide; cols = :union, promote = true)
+
+    budget_usage_df = DataFrame(name = String[], budget_used_pct = Float64[])
+    for gen_name in sort(collect(selected_gen_names))
+        total_dispatch_mwh = sum(hydro_dispatch_wide[!, gen_name])
+        total_budget_mwh = total_budget_mwh_by_name[gen_name]
+        budget_used_pct = total_budget_mwh > 0 ? 100 * total_dispatch_mwh / total_budget_mwh : NaN
+        #println(
+        #    "Total budget used for hydro unit ",
+        #    gen_name,
+        #    ": ",
+        #    budget_used_pct,
+        #    "% (",
+        #    total_dispatch_mwh,
+        #    " MWh / ",
+        #    total_budget_mwh,
+        #    " MWh)",
+        #)
+        push!(budget_usage_df, (name = gen_name, budget_used_pct = budget_used_pct))
+    end
+
+    append!(hydro_budget_usage_accumulated, budget_usage_df; cols = :union, promote = true)
+ 
+
+    # Find ED hydro dispatch and ED energy price tables
+    hydro_key = only([k for k in keys(ved) if occursin("ActivePowerVariable", String(k)) && occursin("HydroDispatch", String(k))])
+    price_key = only([k for k in keys(ded) if occursin("CopperPlateBalanceConstraint", String(k))])
+
+
+    hydro_sd = ved[hydro_key]   # SortedDict{DateTime, DataFrame}
+    price_sd = ded[price_key]   # SortedDict{DateTime, DataFrame}
+
+    # Flatten SortedDict -> one DataFrame (attach DateTime if missing)
+    to_df(sd) = vcat([
+        begin
+            x = copy(df)
+            #if :DateTime ∉ names(x)
+            #    x.DateTime = fill(dt, nrow(x))
+            #end
+            x
+        end
+        for (dt, df) in pairs(sd)
+    ]...)
+
+    hydro_df = to_df(hydro_sd)
+    price_df = to_df(price_sd)
+
+    comp_col = :component_name in names(hydro_df) ? :component_name : :name
+
+    # Keep only selected hydro generators
+    hydro_df = filter(row -> row[comp_col] in selected_gen_names, hydro_df)
+
+    # Join dispatch with price
+    rev_df = innerjoin(
+        select(hydro_df, :DateTime, comp_col, :value),
+        select(price_df, :DateTime, :value),
+        on = :DateTime,
+        makeunique = true,
+    )
+
+    DataFrames.rename!(rev_df, comp_col => :gen_name, :value => :mw, :value_1 => :price)
+
+
+    # 1-hour ED resolution => MWh = MW
+    rev_df.energy_mwh = rev_df.mw
+    rev_df.revenue = rev_df.energy_mwh .* rev_df.price/100 # price is in $ per 100 MWh, so divide by 100 to get $ per MWh
+    rev_df.production_cost = zeros(nrow(rev_df))   # or: fill(0.0, nrow(rev_df))
+    rev_df.profit = rev_df.revenue .- rev_df.production_cost
+
+
+    # Map generator -> plant
+    gen_to_plant = Dict(g => plant for (plant, (_, gens)) in selected_hydro_details for g in gens)
+    rev_df.plant = [get(gen_to_plant, g, "UNKNOWN") for g in rev_df.gen_name]
+
+    # Summaries
+    by_gen = combine(groupby(rev_df, :gen_name),
+        :energy_mwh => sum => :energy_mwh,
+        :revenue => sum => :revenue,
+        :profit => sum => :profit,
+    )
+
+    by_plant = combine(groupby(rev_df, :plant),
+        :energy_mwh => sum => :energy_mwh,
+        :revenue => sum => :revenue,
+        :profit => sum => :profit,
+    )
+
+            
+    for row in eachrow(by_plant)
+        plant = String(row.plant)
+        revenue_by_plant[plant] = get(revenue_by_plant, plant, 0.0) + Float64(row.revenue)
+    end
+
+    # Write revenue/profit summaries to CSV
+    #hydro_ed_revenue_by_generator_path = joinpath(RESULTS_DIR, "hydro_ed_revenue_by_generator.csv")
+    #hydro_ed_revenue_by_plant_path = joinpath(RESULTS_DIR, "hydro_ed_revenue_by_plant.csv")
+    #if i == 1
+    #    CSV.write(hydro_ed_revenue_by_generator_path, by_gen)
+    #    CSV.write(hydro_ed_revenue_by_plant_path, by_plant)
+    #else
+    #    CSV.write(hydro_ed_revenue_by_generator_path, by_gen; append = true, writeheader = false)
+    #    CSV.write(hydro_ed_revenue_by_plant_path, by_plant; append = true, writeheader = false)
+    #end
+
+
+    # Write price per timestep to a CSV file
+    price_usd_per_mwh_df = copy(price_df)
+    price_usd_per_mwh_df.value ./= get_base_power(system)  # convert from $/100 MWh to $/MWh
+    
+    hydro_ed_prices_path = joinpath(RESULTS_DIR, "hydro_ed_prices.csv")
+    if i == 1
+        CSV.write(hydro_ed_prices_path, price_usd_per_mwh_df)
+    else
+        CSV.write(hydro_ed_prices_path, price_usd_per_mwh_df; append = true, writeheader = false)
+    end
+
+
 end
 
-# Combine all plots into a single figure
-fig = plot(p_price, plant_plots...; layout=(5, 1), link=:x, size=(1500, 1500), dpi=150,
-    left_margin=8Plots.mm, bottom_margin=10Plots.mm, right_margin=8Plots.mm)
-display(fig)
-savefig(fig, joinpath(RESULTS_DIR, "hydro_dispatch_price_combined.png"))
+# Write selected hydro dispatch once after collecting all iterations.
+CSV.write(joinpath(RESULTS_DIR, "selected_hydro_dispatch_wide.csv"), hydro_dispatch_accumulated)
+
+# Write selected hydro budget usage once after collecting all iterations.
+CSV.write(joinpath(RESULTS_DIR, "hydro_budget_usage_pct.csv"), hydro_budget_usage_accumulated)
+
+# Write price per timestep once after collecting all iterations.
+CSV.write(joinpath(RESULTS_DIR, "hydro_ed_prices.csv"), price_accumulated)
+
+# Write total revenue by plant over all timesteps to a CSV file
+# Note:This is ordered as Mammoth, Shasta, Devil Canyon
+CSV.write(joinpath(RESULTS_DIR, "hydro_ed_total_revenue_by_plant.csv"), DataFrame(plant=collect(keys(revenue_by_plant)), revenue=collect(values(revenue_by_plant))))
 
 
 
