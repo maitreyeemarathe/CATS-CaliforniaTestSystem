@@ -1,0 +1,4 @@
+{"timestamp":"2026-08-04T15:47:19.38","status":"start","step":1,"name":"SimulationStepEvent","simulation_time":"2019-01-01T00:00:00.0"}
+{"timestamp":"2026-08-04T15:47:19.421","model_name":"ED","status":"start","step":1,"name":"ProblemExecutionEvent","simulation_time":"2019-01-01T00:00:00.0"}
+{"timestamp":"2026-08-04T15:47:32.519","model_name":"ED","status":"done","step":1,"name":"ProblemExecutionEvent","simulation_time":"2019-01-01T00:00:00.0"}
+{"timestamp":"2026-08-04T15:47:32.52","status":"done","step":1,"name":"SimulationStepEvent","simulation_time":"2019-01-01T00:00:00.0"}

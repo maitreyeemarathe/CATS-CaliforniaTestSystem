@@ -1,5 +1,5 @@
 
-#ENV["XPRESSDIR"] = "$(homedir())/Documents/Xpress"
+ENV["XPRESSDIR"] = "$(homedir())/Documents/Xpress"
 
 # if environmnent isn't set up, see top of Script/uc_ed_with_ac_pf.jl for setup instructions
 using PowerSystems
@@ -8,7 +8,7 @@ using HydroPowerSimulations
 using PowerSystemCaseBuilder
 using PowerFlows
 #using Ipopt
-#using Xpress
+using Xpress
 using HiGHS
 using Dates
 using JuMP
@@ -21,7 +21,7 @@ using Plots
 
 BASE_DIR = joinpath(@__DIR__, "..")
 HYDRO_DATA_DIR = "$BASE_DIR/hydro_data/"
-RESULTS_DIR = "$BASE_DIR/results/annual_baseline/"
+RESULTS_DIR = "$BASE_DIR/results/annual_baseline_ed/"
 CATS_DIR = "$BASE_DIR/Sienna/"
 
 include(joinpath(CATS_DIR, "baseline_build_CATS_modified.jl"))
@@ -91,7 +91,7 @@ start_time = DateTime("2019-01-01T00:00:00")
 horizon_hours_int = Int(24)
 horizon_hours = Hour(horizon_hours_int)
 model_interval = Hour(24)
-sim_steps = Int(7*52)  
+sim_steps = Int(1)  
 
 # Calculate total budget for each selected hydro unit by summing the hourly budget values over the horizon starting at start_time.
 total_budget_mwh_by_name = Dict{String, Float64}()
@@ -124,13 +124,15 @@ set_device_model!(template, HydroDispatch, HydroDispatchRunOfRiverBudget)
 set_device_model!(template, PowerLoad, StaticPowerLoad)
 set_device_model!(template, Line, StaticBranch)
 set_device_model!(template, Transformer2W, StaticBranch)
+set_device_model!(template, Source, ImportExportSourceModel)
  
-solver_highs = JuMP.optimizer_with_attributes(HiGHS.Optimizer) 
+#solver_highs = JuMP.optimizer_with_attributes(HiGHS.Optimizer) 
+solver_xpress = JuMP.optimizer_with_attributes(Xpress.Optimizer)
 
 problem = DecisionModel(
     template,
     system;
-    optimizer=solver_highs,
+    optimizer=solver_xpress,
     optimizer_solve_log_print=true,
     calculate_conflict=true,
     horizon = horizon_hours,
@@ -171,7 +173,7 @@ dispatch_thermal = read_variable(ed_results, "ActivePowerVariable__ThermalStanda
 dispatch_renewable = read_variable(ed_results, "ActivePowerVariable__RenewableDispatch")
 dispatch_tables = [dispatch_hydro, dispatch_thermal, dispatch_renewable]
 
-#=
+
 dispatch_xlsx_path = joinpath(RESULTS_DIR, "ed_dispatch_all_generators_by_timestep.xlsx")
 dispatch_timesteps = sort(unique(vcat([collect(keys(sd)) for sd in dispatch_tables]...)))
 
@@ -205,7 +207,7 @@ XLSX.openxlsx(dispatch_xlsx_path, mode = "w") do xf
 end
 
 println("Wrote all-generator dispatch workbook: $(dispatch_xlsx_path)")
-=#
+
 
 # Write the dispatch of all selected hydro units to a CSV file for external analysis.
 hydro_dispatch_timesteps = sort(unique(vcat([DateTime.(df[!, :DateTime]) for df in values(dispatch_hydro)]...)))

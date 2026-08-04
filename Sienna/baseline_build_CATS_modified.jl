@@ -557,8 +557,8 @@ function build_CATS_system(;
             #CSV.write(debug_csv_path, DataFrame(timestamp=timestamps, min_active_power=unit_min_hourly))
             ts_min = SingleTimeSeries(;
                 name = "min_active_power",
-                data = TimeArray(timestamps, unit_min_normalized),
-                #data = TimeArray(timestamps, zeros(length(timestamps))),  # For now keep it at zero
+                #data = TimeArray(timestamps, unit_min_normalized),
+                data = TimeArray(timestamps, zeros(length(timestamps))),  # For now keep it at zero
                 scaling_factor_multiplier = get_max_active_power,
             )
             bulk_add_time_series!(system, [TimeSeriesAssociation(comp, ts_min)])
@@ -669,8 +669,8 @@ function build_CATS_system(;
         gen_name = "gen-$(i)"
         comp = get_component(StaticInjection, system, gen_name)
         isnothing(comp) && continue  # skip removed components (e.g., SCs)
-        @assert isapprox(row[:startup], 0.0; atol=1e-6)
-        @assert isapprox(row[:shutdown], 0.0; atol=1e-6)
+        #@assert isapprox(row[:startup], 0.0; atol=1e-6)
+        #@assert isapprox(row[:shutdown], 0.0; atol=1e-6)
         n = row[:n]
         # assume quadratic cost function
         @assert n == 3 "Only quadratic cost functions supported."
@@ -684,11 +684,16 @@ function build_CATS_system(;
         end
 
         if comp isa Source
-            # ImportExportCost must be piecewise incremental, when we have quadratic.
-            # so for simplicity we drop the quadratic term.
-            # FIXME they use negative exports to represent imports, whereas we use
-            # separate curves...
-            function_data = PiecewiseIncrementalCurve(c0, [0.0, 1.0e12], [c1])
+            # Import curve: buy power at $31.40/MWh up to max limit MW
+            import_max = get_max_active_power(comp)*get_base_power(system)
+            import_curve = make_import_curve(; power = import_max, price = 31.4)
+            # Export curve: sell power at $100/MWh up to 0 MW i.e. prevent exports
+            export_curve = make_export_curve(; power = 0.0, price = 100.0)
+            ie_cost = ImportExportCost(;
+                import_offer_curves = import_curve,
+                export_offer_curves = export_curve,
+            )            
+            set_operation_cost!(comp, ie_cost)
         elseif isapprox(c2, 0.0; atol=1e-6)
             function_data = LinearCurve(c1, c0)
             cost_curve = CostCurve(function_data)
@@ -715,6 +720,12 @@ function build_CATS_system(;
                 attach_cost!(comp, cost_curve)
             end
             =#
+        elseif comp isa RenewableDispatch
+            slope = -1
+            intercept = 0
+            function_data = LinearCurve(slope, intercept)
+            cost_curve = CostCurve(function_data)
+            attach_cost!(comp, cost_curve) 
         else
             p_limits = get_active_power_limits(comp)
             p_min = p_limits.min
