@@ -1,4 +1,4 @@
-function run_equal_daily_budget(template, system, solver_xpress, start_time,results_directory, selected_gen_names, selected_hydro_details)
+function run_relaxed_pmin(template, system, solver_xpress, start_time,results_directory, selected_gen_names, selected_hydro_details)
 
     for comp in get_components(HydroDispatch, system)
         if get_name(comp) in selected_gen_names
@@ -44,7 +44,7 @@ function run_equal_daily_budget(template, system, solver_xpress, start_time,resu
     horizon_hours_int = Int(24)
     horizon_hours = Hour(horizon_hours_int)
     model_interval = Hour(24)
-    sim_steps = Int(7*HORIZON_WEEKS)  
+    sim_steps = Int(7*8)
 
     transform_single_time_series!(
         system,
@@ -64,7 +64,7 @@ function run_equal_daily_budget(template, system, solver_xpress, start_time,resu
         initial_time = start_time,
         calculate_conflict=false,
         store_variable_names = false,
-        name="equal_daily_budget",
+        name="baseline_week",
     )
 
     model = SimulationModels(;decision_models = problem)
@@ -94,13 +94,13 @@ function run_equal_daily_budget(template, system, solver_xpress, start_time,resu
                 start_time = start_time,
                 len = sim_steps*horizon_hours_int,
             )
-            total_budget_mwh = sum(budget_vals)
+            total_budget_mwh = sum(budget_vals).*get_base_power(system)  # Convert from per-unit to MW, then multiply by hours to get MWh
             println("Total budget for hydro unit $(get_name(comp)) over the horizon starting at $(start_time): $(total_budget_mwh) MWh")
             total_budget_mwh_by_name[get_name(comp)] = total_budget_mwh
         end
     end
 
-    problem_results = get_decision_problem_results(results, "equal_daily_budget")
+    problem_results = get_decision_problem_results(results, "baseline_week")
 
     # Compute revenue/profit for selected hydro units in ED
     problem_variables = read_variables(problem_results)
@@ -354,4 +354,15 @@ function run_equal_daily_budget(template, system, solver_xpress, start_time,resu
     display(fig)
     savefig(fig, joinpath(results_directory, "hydro_dispatch_price_combined.png"))
 
+    # Marginal generator at each timestep
+    #=
+    all_dispatch = vcat(
+        [vcat([copy(df) for df in values(sd)]...) for sd in [dispatch_hydro, dispatch_thermal, dispatch_renewable]]...
+    )
+    demand_param_dict = read_parameter(problem_results, "ActivePowerTimeSeriesParameter__PowerLoad")
+    demand_df_all = vcat([copy(df) for df in values(demand_param_dict)]...)
+    price_usd_per_mwh_df = copy(price_df)
+    price_usd_per_mwh_df.value ./= get_base_power(system)
+    write_marginal_generators(all_dispatch, price_usd_per_mwh_df, demand_df_all, system, results_directory)
+    =#
 end

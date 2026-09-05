@@ -44,7 +44,7 @@ function run_equal_daily_budget(template, system, solver_xpress, start_time,resu
     horizon_hours_int = Int(24)
     horizon_hours = Hour(horizon_hours_int)
     model_interval = Hour(24)
-    sim_steps = Int(7*HORIZON_WEEKS)  
+    sim_steps = Int(7)  
 
     transform_single_time_series!(
         system,
@@ -77,7 +77,7 @@ function run_equal_daily_budget(template, system, solver_xpress, start_time,resu
         steps = sim_steps,
         models = model,
         sequence = sequence,
-        simulation_folder = mktempdir(),
+        simulation_folder = results_directory,
         initial_time=start_time
     )
     build!(sim)
@@ -353,5 +353,15 @@ function run_equal_daily_budget(template, system, solver_xpress, start_time,resu
         left_margin=8Plots.mm, bottom_margin=10Plots.mm, right_margin=8Plots.mm)
     display(fig)
     savefig(fig, joinpath(results_directory, "hydro_dispatch_price_combined.png"))
+
+    # Marginal generator at each timestep
+    all_dispatch = vcat(
+        [vcat([copy(df) for df in values(sd)]...) for sd in [dispatch_hydro, dispatch_thermal, dispatch_renewable]]...
+    )
+    demand_param_dict = read_parameter(problem_results, "ActivePowerTimeSeriesParameter__PowerLoad")
+    demand_df_all = vcat([copy(df) for df in values(demand_param_dict)]...)
+    price_usd_per_mwh_df = copy(price_df)
+    price_usd_per_mwh_df.value ./= get_base_power(system)
+    write_marginal_generators(all_dispatch, price_usd_per_mwh_df, demand_df_all, system, results_directory)
 
 end

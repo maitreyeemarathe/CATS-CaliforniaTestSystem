@@ -1,8 +1,8 @@
 using CSV, DataFrames, Plots, Dates, Statistics, StatsPlots
 
-SCENARIO = "rcp45hotter"
+SCENARIO = "hist"
 BASE_DIR = normpath(joinpath(@__DIR__, "..", ".."))
-HYDRO_DATA_DIR = joinpath(BASE_DIR, "hydro_data", "2025_scenarios")
+HYDRO_DATA_DIR = joinpath(BASE_DIR, "hydro_data", "historical")
 GEN_CSV = joinpath(BASE_DIR, "GIS", "CATS_gens.csv")
 
 plant_keys = Dict("Shasta" => "shasta", "Mammoth" => "mammoth", "Devil Canyon" => "devilcanyon")
@@ -12,6 +12,9 @@ plant_filters = Dict(
     "Devil Canyon" => (plant_code = 436, bus = 1005, gen_ids = Set(["1", "2", "3", "4"])),
     "Mammoth" => (plant_code = 344, bus = 1636, gen_ids = Set(["1", "2"])),
 )
+
+# Set false (or comment out the analysis block in main) to skip the estimated-allocation analysis.
+RUN_ESTIMATED_ALLOCATION_ANALYSIS = true
 
 function parse_datetime(x)::DateTime
     x isa DateTime && return x
@@ -83,9 +86,9 @@ function gini(x::AbstractVector{<:Real})::Float64
     return (2.0 * sum(i * xs[i] for i in 1:n)) / (n * sum(xs)) - (n + 1) / n
 end
 
-function n_max_hours_for_week(plant_name::String, week_start_date::Date)::Int
+function n_max_hours_for_week(plant_name::String, week_start_date::Date, budget_year::Int)::Int
     key = plant_keys[plant_name]
-    hydro_df = CSV.read(joinpath(HYDRO_DATA_DIR, "$(key)_$(SCENARIO)_hourly.csv"), DataFrame)
+    hydro_df = CSV.read(joinpath(HYDRO_DATA_DIR, "$(key)_$(SCENARIO)_$(budget_year)_hourly.csv"), DataFrame)
     hydro_df.week_start = Date.(string.(hydro_df.week_start))
     week_rows = filter(r -> r.week_start == week_start_date, hydro_df)
     isempty(week_rows) && return -1
@@ -121,24 +124,73 @@ function week_price_gini(run_dir::String, week_start::DateTime, n::Int)::Float64
     return gini(counts)
 end
 
-function discover_fraction_cases(start_date_dir::String)
-    equal_tags = Set(String[replace(d, "equal_" => "") for d in readdir(joinpath(@__DIR__, start_date_dir)) if startswith(d, "equal_fr")])
-    greedy_tags = Set(String[replace(d, "greedy_" => "") for d in readdir(joinpath(@__DIR__, start_date_dir)) if startswith(d, "greedy_fr")])
-    tags = sort(collect(intersect(equal_tags, greedy_tags)); by = tag -> parse(Int, replace(tag, "fr" => "")))
-    return [(tag = tag, fraction_reduction = parse(Int, replace(tag, "fr" => "")) / 100.0) for tag in tags]
+# ── Optional estimated-allocation analysis ────────────────────────────────────
+
+function greedy_dispatch(prices::Vector{Float64}, p_max::Vector{Float64}, p_min::Vector{Float64}, budget_mwh::Float64)
+    dispatch = copy(p_min)
+    remaining_budget = budget_mwh - sum(dispatch)
+    remaining_budget < -1e-6 && error("Weekly budget is below the Pmin energy requirement")
+
+    for i in sortperm(prices, rev = true)
+        remaining_budget <= 1e-6 && break
+        increment = min(p_max[i] - dispatch[i], remaining_budget)
+        dispatch[i] += increment
+        remaining_budget -= increment
+    end
+    remaining_budget > 1e-6 && error("Weekly budget exceeds the Pmax energy limit")
+    return dispatch
+end
+
+function estimate_allocation_revenues(plant_name::String, week_start::DateTime, budget_year::Int, equal_dir::String)
+    key = plant_keys[plant_name]
+    hydro_df = CSV.read(joinpath(HYDRO_DATA_DIR, "$(key)_$(SCENARIO)_$(budget_year)_hourly.csv"), DataFrame)
+    normalize_datetime!(hydro_df, :datetime)
+    week_end = week_start + Day(7)
+    week_hydro = filter(r -> week_start <= r.datetime < week_end, hydro_df)
+    nrow(week_hydro) == 168 || error("Expected 168 hydro rows for $plant_name starting $week_start")
+    sort!(week_hydro, :datetime)
+
+    prices = CSV.read(joinpath(equal_dir, "shadow_prices.csv"), DataFrame)
+    normalize_datetime!(prices, :DateTime)
+    price_by_time = Dict(row.DateTime => Float64(row.value) for row in eachrow(prices))
+    price_values = [price_by_time[dt] for dt in week_hydro.datetime]
+    p_max = Float64.(week_hydro.week_p_max)
+    p_min = Float64.(week_hydro.week_p_min)
+    weekly_budget = sum(Float64.(week_hydro.budget_hour))
+
+    greedy_power = greedy_dispatch(price_values, p_max, p_min, weekly_budget)
+    equal_power = zeros(Float64, length(price_values))
+    daily_budget = weekly_budget / 7.0
+    for day in 1:7
+        day_idx = (day - 1) * 24 + 1:day * 24
+        equal_power[day_idx] = greedy_dispatch(price_values[day_idx], p_max[day_idx], p_min[day_idx], daily_budget)
+    end
+
+    equal_revenue = sum(price_values .* equal_power)
+    greedy_revenue = sum(price_values .* greedy_power)
+    return equal_revenue, greedy_revenue
+end
+
+function discover_budget_cases(start_date_dir::String)
+    equal_tags = Set(String[replace(d, "equal_" => "") for d in readdir(joinpath(@__DIR__, start_date_dir)) if startswith(d, "equal_bud")])
+    greedy_tags = Set(String[replace(d, "greedy_" => "") for d in readdir(joinpath(@__DIR__, start_date_dir)) if startswith(d, "greedy_bud")])
+    tags = sort(collect(intersect(equal_tags, greedy_tags)); by = tag -> parse(Int, replace(tag, "bud" => "")))
+    return [(tag = tag, budget_year = parse(Int, replace(tag, "bud" => ""))) for tag in tags]
 end
 
 function main()
     plant_gen_names = get_plant_gen_names(GEN_CSV)
     start_date_dirs = sort(filter(d -> isdir(joinpath(@__DIR__, d)) && occursin(r"^\d{4}-\d{2}-\d{2}$", d), readdir(@__DIR__)))
 
-    rows = NamedTuple{(:plant, :fr_case, :fraction_reduction, :week_start, :gini_coeff, :n_max_hours, :revenue_diff_pct),
-                      Tuple{String, String, Float64, Date, Float64, Int, Float64}}[]
-    weekly_revenue_rows = NamedTuple{(:plant, :fr_case, :fraction_reduction, :week_start, :equal_revenue, :greedy_revenue),
-                                     Tuple{String, String, Float64, Date, Float64, Float64}}[]
+    rows = NamedTuple{(:plant, :budget_case, :budget_year, :week_start, :gini_coeff, :n_max_hours, :revenue_diff_pct),
+                      Tuple{String, String, Int, Date, Float64, Int, Float64}}[]
+    weekly_revenue_rows = NamedTuple{(:plant, :budget_case, :budget_year, :week_start, :equal_revenue, :greedy_revenue),
+                                     Tuple{String, String, Int, Date, Float64, Float64}}[]
+    estimated_revenue_rows = NamedTuple{(:plant, :budget_case, :budget_year, :week_start, :actual_revenue_increase_pct, :estimated_equal_revenue, :estimated_greedy_revenue, :estimated_revenue_increase_pct),
+                                        Tuple{String, String, Int, Date, Float64, Float64, Float64, Float64}}[]
 
     for start_date_dir in start_date_dirs
-        for case in discover_fraction_cases(start_date_dir)
+        for case in discover_budget_cases(start_date_dir)
             equal_dir = joinpath(@__DIR__, start_date_dir, "equal_$(case.tag)")
             greedy_dir = joinpath(@__DIR__, start_date_dir, "greedy_$(case.tag)")
             (isdir(equal_dir) && isdir(greedy_dir)) || continue
@@ -150,25 +202,45 @@ function main()
             for row in eachrow(joined)
                 plant = String(row.plant)
                 week_start = row.week_start
-                n_max = n_max_hours_for_week(plant, Date(week_start))
+                n_max = n_max_hours_for_week(plant, Date(week_start), case.budget_year)
                 n_max < 0 && continue
                 g = week_price_gini(greedy_dir, week_start, n_max)
                 equal_revenue = Float64(row.revenue)
                 greedy_revenue = Float64(row.revenue_1)
                 revenue_diff_pct = 100.0 * (greedy_revenue - equal_revenue) / abs(equal_revenue)
 
+                if RUN_ESTIMATED_ALLOCATION_ANALYSIS
+                    estimated_equal_revenue, estimated_greedy_revenue = estimate_allocation_revenues(
+                        plant,
+                        week_start,
+                        case.budget_year,
+                        equal_dir,
+                    )
+                    estimated_revenue_increase_pct = 100.0 * (estimated_greedy_revenue - estimated_equal_revenue) / abs(estimated_equal_revenue)
+                    push!(estimated_revenue_rows, (
+                        plant = plant,
+                        budget_case = case.tag,
+                        budget_year = case.budget_year,
+                        week_start = Date(week_start),
+                        actual_revenue_increase_pct = revenue_diff_pct,
+                        estimated_equal_revenue = estimated_equal_revenue,
+                        estimated_greedy_revenue = estimated_greedy_revenue,
+                        estimated_revenue_increase_pct = estimated_revenue_increase_pct,
+                    ))
+                end
+
                 push!(weekly_revenue_rows, (
                     plant = plant,
-                    fr_case = case.tag,
-                    fraction_reduction = case.fraction_reduction,
+                    budget_case = case.tag,
+                    budget_year = case.budget_year,
                     week_start = Date(week_start),
                     equal_revenue = equal_revenue,
                     greedy_revenue = greedy_revenue,
                 ))
                 push!(rows, (
                     plant = plant,
-                    fr_case = case.tag,
-                    fraction_reduction = case.fraction_reduction,
+                    budget_case = case.tag,
+                    budget_year = case.budget_year,
                     week_start = Date(week_start),
                     gini_coeff = g,
                     n_max_hours = n_max,
@@ -179,33 +251,46 @@ function main()
     end
 
     results_df = DataFrame(rows)
-    sort!(results_df, [:week_start, :fraction_reduction, :plant])
-    CSV.write(joinpath(@__DIR__, "load_skew_gini_vs_revenue_diff.csv"), results_df)
+    sort!(results_df, [:week_start, :budget_year, :plant])
+    CSV.write(joinpath(@__DIR__, "budget_gini_vs_revenue_diff.csv"), results_df)
     weekly_revenue_df = DataFrame(weekly_revenue_rows)
-    sort!(weekly_revenue_df, [:week_start, :fraction_reduction, :plant])
-    CSV.write(joinpath(@__DIR__, "load_skew_weekly_revenue_equal_vs_greedy.csv"), weekly_revenue_df)
+    sort!(weekly_revenue_df, [:week_start, :budget_year, :plant])
+    CSV.write(joinpath(@__DIR__, "budget_weekly_revenue_equal_vs_greedy.csv"), weekly_revenue_df)
     annual_revenue_df = combine(
-        groupby(weekly_revenue_df, [:plant, :fraction_reduction]),
+        groupby(weekly_revenue_df, [:plant, :budget_year]),
         :equal_revenue => sum => :total_equal_revenue,
         :greedy_revenue => sum => :total_greedy_revenue,
     )
+    annual_revenue_df.budget_level = [
+        year == 2015 ? "Low" : year == 2012 ? "Medium" : year == 2006 ? "High" : "Unknown"
+        for year in annual_revenue_df.budget_year
+    ]
     annual_revenue_df.revenue_increase_pct = 100.0 .* (
         annual_revenue_df.total_greedy_revenue .- annual_revenue_df.total_equal_revenue
     ) ./ abs.(annual_revenue_df.total_equal_revenue)
-    annual_revenue_table = select(annual_revenue_df, :plant, :fraction_reduction, :revenue_increase_pct)
+    select!(annual_revenue_df, :plant, :budget_level, :budget_year, :total_equal_revenue, :total_greedy_revenue, :revenue_increase_pct)
+    sort!(annual_revenue_df, [:budget_year, :plant])
+    CSV.write(joinpath(@__DIR__, "annual_revenue_increase_by_plant_and_budget_level.csv"), annual_revenue_df)
+    annual_revenue_table = select(annual_revenue_df, :plant, :budget_level, :revenue_increase_pct)
     annual_revenue_table.plant_order = [plant == "Shasta" ? 1 : plant == "Mammoth" ? 2 : plant == "Devil Canyon" ? 3 : 4 for plant in annual_revenue_table.plant]
-    skew_levels = sort(unique(annual_revenue_table.fraction_reduction))
-    annual_revenue_table.skew_order = [findfirst(==(fraction), skew_levels) for fraction in annual_revenue_table.fraction_reduction]
-    sort!(annual_revenue_table, [:plant_order, :skew_order])
+    annual_revenue_table.budget_order = [budget == "Low" ? 1 : budget == "Medium" ? 2 : budget == "High" ? 3 : 4 for budget in annual_revenue_table.budget_level]
+    sort!(annual_revenue_table, [:plant_order, :budget_order])
     annual_revenue_table[!, :plant] = replace.(annual_revenue_table.plant, "Mammoth" => "Mammoth Pool")
-    annual_revenue_table[!, :fraction_reduction] = ["$(round(Int, 100 * fraction))%" for fraction in annual_revenue_table.fraction_reduction]
     annual_revenue_table[!, :revenue_increase_pct] = round.(annual_revenue_table.revenue_increase_pct, digits = 2)
-    select!(annual_revenue_table, :plant, :fraction_reduction, :revenue_increase_pct)
-    rename!(annual_revenue_table, :plant => :Plant, :fraction_reduction => :Load_Skew, :revenue_increase_pct => Symbol("Increase in annual revenue (%)"))
-    CSV.write(joinpath(@__DIR__, "annual_revenue_increase_by_plant_and_load_skew.csv"), annual_revenue_table)
+    select!(annual_revenue_table, :plant, :budget_level, :revenue_increase_pct)
+    rename!(annual_revenue_table, :plant => :Plant, :budget_level => :Budget, :revenue_increase_pct => Symbol("Increase in annual revenue (%)"))
+    CSV.write(joinpath(@__DIR__, "annual_revenue_increase_table.csv"), annual_revenue_table)
     println("results_df has $(nrow(results_df)) rows")
     println("weekly_revenue_df has $(nrow(weekly_revenue_df)) rows")
-    println("Saved -> annual_revenue_increase_by_plant_and_load_skew.csv")
+    println("annual_revenue_df has $(nrow(annual_revenue_df)) rows")
+    println("Saved -> annual_revenue_increase_table.csv")
+
+    if RUN_ESTIMATED_ALLOCATION_ANALYSIS
+        estimated_revenue_df = DataFrame(estimated_revenue_rows)
+        sort!(estimated_revenue_df, [:week_start, :budget_year, :plant])
+        CSV.write(joinpath(@__DIR__, "budget_estimated_vs_actual_revenue_increase.csv"), estimated_revenue_df)
+        println("estimated_revenue_df has $(nrow(estimated_revenue_df)) rows")
+    end
 
     closeall()
     gr()
@@ -227,20 +312,51 @@ function main()
             label = plant,
             marker = plant_markers[plant],
             markersize = 7,
-            marker_z = results_df.fraction_reduction[plant_idx],
+            marker_z = results_df.budget_year[plant_idx],
             markercolor = cgrad(:viridis),
             markerstrokewidth = 1,
-            colorbar_title = "Fraction\nReduction",
+            colorbar_title = "Budget\nYear",
         )
     end
 
     hline!(p, [0.0]; color = :black, lw = 1, ls = :dot, label = "")
-    savefig(p, joinpath(@__DIR__, "scatter_load_skew_gini_vs_revenue_diff.png"))
-    println("Saved -> scatter_load_skew_gini_vs_revenue_diff.png")
+    savefig(p, joinpath(@__DIR__, "scatter_budget_gini_vs_revenue_diff.png"))
+    println("Saved -> scatter_budget_gini_vs_revenue_diff.png")
 
-    nmax_gini = results_df.n_max_hours .* (1 .+ results_df.gini_coeff)
+    if RUN_ESTIMATED_ALLOCATION_ANALYSIS
+        p_estimate = plot(;
+            xlabel = "Estimated Revenue Increase: Greedy vs Equal (%)",
+            ylabel = "Actual Revenue Increase: Greedy vs Equal (%)",
+            title = "Actual vs Estimated Greedy Allocation Benefit",
+            legend = :bottomright,
+            size = (950, 600),
+            dpi = 150,
+            left_margin = 10Plots.mm,
+            right_margin = 35Plots.mm,
+        )
+        for plant in keys(plant_markers)
+            sub = filter(r -> r.plant == plant, estimated_revenue_df)
+            isempty(sub) && continue
+            scatter!(p_estimate, sub.estimated_revenue_increase_pct, sub.actual_revenue_increase_pct;
+                label = plant,
+                marker = plant_markers[plant],
+                markersize = 7,
+                marker_z = sub.budget_year,
+                markercolor = cgrad(:viridis),
+                markerstrokewidth = 1,
+                colorbar_title = "Budget\nYear",
+            )
+        end
+        plot!(p_estimate, [-0.5, 2.5], [-0.5, 2.5]; color = :black, lw = 1, ls = :dash, label = "Actual = Estimated")
+        savefig(p_estimate, joinpath(@__DIR__, "actual_vs_estimated_revenue_increase.png"))
+        println("Saved -> actual_vs_estimated_revenue_increase.png")
+    end
+
+    #nmax_gini = results_df.n_max_hours .* (1 .+ results_df.gini_coeff)
+    nmax_gini = (1 .- abs.(results_df.n_max_hours .- 168/2)./ (168/2)) + results_df.gini_coeff
     p_nmax_gini = plot(;
-        xlabel = "Nmax Hours x (1 + Gini Coefficient)",
+        #xlabel = "Nmax Hours x (1 + Gini Coefficient)",
+        xlabel = "|Nmax Hours - 84| / 84 + Gini Coefficient",
         ylabel = "Revenue Increase: Greedy vs Equal (%)",
         legend = :bottomright,
         size = (950, 600),
@@ -256,16 +372,16 @@ function main()
             label = plant,
             marker = plant_markers[plant],
             markersize = 7,
-            marker_z = results_df.fraction_reduction[plant_idx],
+            marker_z = results_df.budget_year[plant_idx],
             markercolor = cgrad(:viridis),
             markerstrokewidth = 1,
-            colorbar_title = "Fraction\nReduction",
+            colorbar_title = "Budget\nYear",
         )
     end
 
     hline!(p_nmax_gini, [0.0]; color = :black, lw = 1, ls = :dot, label = "")
-    savefig(p_nmax_gini, joinpath(@__DIR__, "scatter_load_skew_nmax_gini_vs_revenue_diff.png"))
-    println("Saved -> scatter_load_skew_nmax_gini_vs_revenue_diff.png")
+    savefig(p_nmax_gini, joinpath(@__DIR__, "scatter_budget_nmax_gini_vs_revenue_diff.png"))
+    println("Saved -> scatter_budget_nmax_gini_vs_revenue_diff.png")
 
     week_numbers = week.(results_df.week_start)
     p_week = plot(;
@@ -285,52 +401,51 @@ function main()
             label = plant,
             marker = plant_markers[plant],
             markersize = 7,
-            marker_z = results_df.fraction_reduction[plant_idx],
+            marker_z = results_df.budget_year[plant_idx],
             markercolor = cgrad(:viridis),
             markerstrokewidth = 1,
-            colorbar_title = "Fraction\nReduction",
+            colorbar_title = "Budget\nYear",
         )
     end
 
     hline!(p_week, [0.0]; color = :black, lw = 1, ls = :dot, label = "")
-    savefig(p_week, joinpath(@__DIR__, "weekly_revenue_increase_by_load_skew.png"))
-    println("Saved -> weekly_revenue_increase_by_load_skew.png")
+    savefig(p_week, joinpath(@__DIR__, "weekly_revenue_increase_by_budget_year.png"))
+    println("Saved -> weekly_revenue_increase_by_budget_year.png")
 
-    fraction_levels = sort(unique(results_df.fraction_reduction))
-    fraction_labels = ["$(round(Int, 100 * fraction))%" for fraction in fraction_levels]
+    budget_levels = [("Low", 2015), ("Medium", 2012), ("High", 2006)]
     p_violin = plot(;
-        xlabel = "Load Skew",
+        xlabel = "Hydro Energy Budget",
         ylabel = "Revenue Increase: Greedy vs Equal (%)",
         title = "Distribution of Greedy Allocation Revenue Increase",
-        xticks = (eachindex(fraction_levels), fraction_labels),
+        xticks = (1:3, first.(budget_levels)),
         legend = :topright,
         size = (950, 600),
         dpi = 150,
         left_margin = 10Plots.mm,
         right_margin = 20Plots.mm,
     )
-    summary_rows = NamedTuple{(:fraction_reduction, :load_skew_pct, :min_revenue_increase_pct, :p25_revenue_increase_pct, :median_revenue_increase_pct, :p75_revenue_increase_pct, :max_revenue_increase_pct),
-                              Tuple{Float64, Int, Float64, Float64, Float64, Float64, Float64}}[]
-    skew_colors = Dict(
-        "0" => :lightskyblue,
-        "10" => :steelblue,
-        "20" => :navy,
+    budget_colors = Dict(
+        "Low" => :lightskyblue,
+        "Medium" => :steelblue,
+        "High" => :navy,
     )
-    for (position, fraction) in enumerate(fraction_levels)
-        values = results_df.revenue_diff_pct[results_df.fraction_reduction .== fraction]
+    summary_rows = NamedTuple{(:budget_level, :budget_year, :min_revenue_increase_pct, :p25_revenue_increase_pct, :median_revenue_increase_pct, :p75_revenue_increase_pct, :max_revenue_increase_pct),
+                              Tuple{String, Int, Float64, Float64, Float64, Float64, Float64}}[]
+    for (position, (label, budget_year)) in enumerate(budget_levels)
+        values = results_df.revenue_diff_pct[results_df.budget_year .== budget_year]
         values = filter(isfinite, values)
         isempty(values) && continue
         violin!(p_violin, fill(position, length(values)), values;
             label = false,
-            color = skew_colors[string(round(Int, 100 * fraction))],
+            color = budget_colors[label],
             alpha = 0.6,
         )
 
         min_value, q25, median_value, q75, max_value = quantile(values, [0.0, 0.25, 0.5, 0.75, 1.0])
-        println("Median revenue increase for $(round(Int, 100 * fraction))% load skew: $(round(median_value, digits = 3))%")
+        println("Median revenue increase for $(lowercase(label)) budget ($(budget_year)): $(round(median_value, digits = 3))%")
         push!(summary_rows, (
-            fraction_reduction = fraction,
-            load_skew_pct = round(Int, 100 * fraction),
+            budget_level = label,
+            budget_year = budget_year,
             min_revenue_increase_pct = min_value,
             p25_revenue_increase_pct = q25,
             median_revenue_increase_pct = median_value,
@@ -344,10 +459,12 @@ function main()
     end
 
     hline!(p_violin, [0.0]; color = :black, lw = 1, ls = :dot, label = false)
-    savefig(p_violin, joinpath(@__DIR__, "violin_revenue_increase_by_load_skew.png"))
-    println("Saved -> violin_revenue_increase_by_load_skew.png")
-    CSV.write(joinpath(@__DIR__, "revenue_increase_summary_by_load_skew.csv"), DataFrame(summary_rows))
-    println("Saved -> revenue_increase_summary_by_load_skew.csv")
+    savefig(p_violin, joinpath(@__DIR__, "violin_revenue_increase_by_budget_level.png"))
+    println("Saved -> violin_revenue_increase_by_budget_level.png")
+    CSV.write(joinpath(@__DIR__, "revenue_increase_summary_by_budget_level.csv"), DataFrame(summary_rows))
+    println("Saved -> revenue_increase_summary_by_budget_level.csv")
 end
 
 main()
+
+

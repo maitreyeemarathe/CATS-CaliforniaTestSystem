@@ -1,4 +1,4 @@
-function run_greedy_daily_budget(system, selected_gen_names, selected_hydro_details, main_start_time, solver_xpress, equal_results_directory, greedy_results_directory)
+function run_greedy_relaxed_pmin(system, selected_gen_names, selected_hydro_details, main_start_time, solver_xpress, equal_results_directory, greedy_results_directory)
 
     # Make a variable for total plant-wise revenue/profit 
     revenue_by_plant = Dict{String, Float64}()
@@ -35,7 +35,7 @@ function run_greedy_daily_budget(system, selected_gen_names, selected_hydro_deta
         end
     end
 
-    for week_i in 1:Int(HORIZON_WEEKS)
+    for week_i in 1:Int(8)
         horizon_hours_int = Int(24)
         horizon_hours = Hour(horizon_hours_int)
         model_interval = Hour(24)
@@ -105,6 +105,17 @@ function run_greedy_daily_budget(system, selected_gen_names, selected_hydro_deta
         set_device_model!(template, PowerLoad, StaticPowerLoad)
         set_device_model!(template, Line, StaticBranch)
         set_device_model!(template, Transformer2W, StaticBranch)
+        #set_device_model!(template, Source, ImportExportSourceModel)
+
+        
+        #solver_highs = JuMP.optimizer_with_attributes(HiGHS.Optimizer) 
+        #solver_xpress = JuMP.optimizer_with_attributes(Xpress.Optimizer)
+        solver_xpress = JuMP.optimizer_with_attributes(Xpress.Optimizer, 
+            "RANDOMSEED" => 123,  # Lock the random seed to a fixed integer
+            "THREADS"    => 1,   # Limit solver to a single thread to prevent multi-threading
+            "MIPRELSTOP" => 0.001,
+            "DETERMINISTIC" => 1,  # Enable deterministic mode for reproducibility
+        )
 
         problem = DecisionModel(
             template,
@@ -124,7 +135,7 @@ function run_greedy_daily_budget(system, selected_gen_names, selected_hydro_deta
             ini_cond_chronology = InterProblemChronology(),
         )
         sim = Simulation(;
-            name = "cats_hydro_ed",
+            name = "cats_hydro_uc",
             steps = sim_steps,
             models = model,
             sequence = sequence,

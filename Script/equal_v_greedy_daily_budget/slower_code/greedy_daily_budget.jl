@@ -35,7 +35,7 @@ function run_greedy_daily_budget(system, selected_gen_names, selected_hydro_deta
         end
     end
 
-    for week_i in 1:Int(HORIZON_WEEKS)
+    for week_i in 1:Int(1)
         horizon_hours_int = Int(24)
         horizon_hours = Hour(horizon_hours_int)
         model_interval = Hour(24)
@@ -105,6 +105,17 @@ function run_greedy_daily_budget(system, selected_gen_names, selected_hydro_deta
         set_device_model!(template, PowerLoad, StaticPowerLoad)
         set_device_model!(template, Line, StaticBranch)
         set_device_model!(template, Transformer2W, StaticBranch)
+        #set_device_model!(template, Source, ImportExportSourceModel)
+
+        
+        #solver_highs = JuMP.optimizer_with_attributes(HiGHS.Optimizer) 
+        #solver_xpress = JuMP.optimizer_with_attributes(Xpress.Optimizer)
+        solver_xpress = JuMP.optimizer_with_attributes(Xpress.Optimizer, 
+            "RANDOMSEED" => 123,  # Lock the random seed to a fixed integer
+            "THREADS"    => 1,   # Limit solver to a single thread to prevent multi-threading
+            "MIPRELSTOP" => 0.001,
+            "DETERMINISTIC" => 1,  # Enable deterministic mode for reproducibility
+        )
 
         problem = DecisionModel(
             template,
@@ -128,7 +139,7 @@ function run_greedy_daily_budget(system, selected_gen_names, selected_hydro_deta
             steps = sim_steps,
             models = model,
             sequence = sequence,
-            simulation_folder = mktempdir(),
+            simulation_folder = greedy_results_directory,
             #joinpath(".", "cats_hydro_ed_simulation"),
             initial_time=start_time
         )
@@ -294,6 +305,16 @@ function run_greedy_daily_budget(system, selected_gen_names, selected_hydro_deta
         else
             CSV.write(hydro_ed_prices_path, price_usd_per_mwh_df; append = true, writeheader = false)
         end
+
+        # Marginal generator at each timestep for this week
+        all_dispatch_week = vcat(
+            [vcat([copy(df) for df in values(sd)]...) for sd in [dispatch_hydro, dispatch_thermal, dispatch_renewable]]...
+        )
+        demand_param_dict = read_parameter(ed_results, "ActivePowerTimeSeriesParameter__PowerLoad")
+        demand_df_week = vcat([copy(df) for df in values(demand_param_dict)]...)
+        week_marginal_dir = joinpath(greedy_results_directory, "week_$(week_i)")
+        mkpath(week_marginal_dir)
+        write_marginal_generators(all_dispatch_week, price_usd_per_mwh_df, demand_df_week, system_copy, week_marginal_dir)
 
     end
 
