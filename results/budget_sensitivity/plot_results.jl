@@ -14,7 +14,7 @@ plant_filters = Dict(
 )
 
 # Set false (or comment out the analysis block in main) to skip the estimated-allocation analysis.
-RUN_ESTIMATED_ALLOCATION_ANALYSIS = true
+RUN_ESTIMATED_ALLOCATION_ANALYSIS = false
 
 function parse_datetime(x)::DateTime
     x isa DateTime && return x
@@ -466,5 +466,62 @@ function main()
 end
 
 main()
+
+function plot_weekly_revenue_equal_by_budget()
+    weekly_revenue_df = CSV.read(joinpath(@__DIR__, "budget_weekly_revenue_equal_vs_greedy.csv"), DataFrame)
+    budget_labels = Dict(2015 => "Low", 2012 => "Medium", 2006 => "High")
+    weekly_revenue_df.budget_level = [get(budget_labels, year, "Unknown") for year in weekly_revenue_df.budget_year]
+    budget_colors = Dict("Low" => :lightskyblue, "Medium" => :steelblue, "High" => :navy)
+    budget_order = ["Low", "Medium", "High"]
+
+    function plot_weekly_revenue(revenue_df::DataFrame, title::String, output_name::String)
+        p = plot(;
+            xlabel = "Week Number",
+            ylabel = "Weekly Revenue (Equal Allocation)",
+            title = title,
+            legend = :bottomright,
+            size = (950, 600),
+            dpi = 150,
+            left_margin = 10Plots.mm,
+            right_margin = 20Plots.mm,
+        )
+
+        for budget_level in budget_order
+            subset = revenue_df[revenue_df.budget_level .== budget_level, :]
+            isempty(subset) && continue
+            sort!(subset, :week_start)
+            plot!(p, week.(subset.week_start), subset.equal_revenue;
+                label = "$(budget_level) budget",
+                marker = :circle,
+                color = budget_colors[budget_level],
+            )
+        end
+
+        savefig(p, joinpath(@__DIR__, output_name))
+        println("Saved -> $(output_name)")
+    end
+
+    for plant in unique(weekly_revenue_df.plant)
+        plant_revenue = weekly_revenue_df[weekly_revenue_df.plant .== plant, :]
+        plant_slug = lowercase(replace(plant, " " => "_"))
+        plot_weekly_revenue(
+            plant_revenue,
+            "Weekly Revenue Under Equal Allocation by Budget Level: $(plant)",
+            "weekly_revenue_equal_allocation_by_budget_level_$(plant_slug).png",
+        )
+    end
+
+    total_revenue = combine(
+        groupby(weekly_revenue_df, [:week_start, :budget_level]),
+        :equal_revenue => sum => :equal_revenue,
+    )
+    plot_weekly_revenue(
+        total_revenue,
+        "Weekly Revenue Under Equal Allocation by Budget Level: All Plants",
+        "weekly_revenue_equal_allocation_by_budget_level_all_plants.png",
+    )
+end
+
+plot_weekly_revenue_equal_by_budget()
 
 
