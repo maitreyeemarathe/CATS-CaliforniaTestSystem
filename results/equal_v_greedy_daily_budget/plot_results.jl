@@ -301,7 +301,7 @@ function main()
     p_violin = plot(;
         xlabel = "Load Skew",
         ylabel = "Revenue Increase: Greedy vs Equal (%)",
-        title = "Distribution of Greedy Allocation Revenue Increase",
+        #title = "Distribution of Weekly Revenue Increase: Greedy vs. Equal Energy Allocation",
         xticks = (eachindex(fraction_levels), fraction_labels),
         legend = :topright,
         size = (950, 600),
@@ -351,3 +351,39 @@ function main()
 end
 
 main()
+
+function plot_weekly_revenue_equal_by_skew()
+    weekly_revenue_df = CSV.read(joinpath(@__DIR__, "load_skew_weekly_revenue_equal_vs_greedy.csv"), DataFrame)
+    skew_colors = Dict(0.0 => :lightskyblue, 0.1 => :steelblue, 0.2 => :navy)
+
+    for plant in unique(weekly_revenue_df.plant)
+        plant_revenue = weekly_revenue_df[weekly_revenue_df.plant .== plant, :]
+        sort!(plant_revenue, [:fraction_reduction, :week_start])
+
+        p = plot(;
+            xlabel = "Week Number",
+            ylabel = "Weekly Revenue (Equal Allocation)",
+            title = "Weekly Revenue Under Equal Allocation by Load Skew: $(plant)",
+            legend = :bottomright,
+            size = (950, 600),
+            dpi = 150,
+            left_margin = 10Plots.mm,
+            right_margin = 20Plots.mm,
+        )
+
+        for fraction in sort(unique(plant_revenue.fraction_reduction))
+            subset = plant_revenue[plant_revenue.fraction_reduction .== fraction, :]
+            plot!(p, week.(subset.week_start), subset.equal_revenue;
+                label = "$(round(Int, 100 * fraction))% load skew",
+                marker = :circle,
+                color = get(skew_colors, fraction, :gray),
+            )
+        end
+
+        plant_slug = lowercase(replace(plant, " " => "_"))
+        savefig(p, joinpath(@__DIR__, "weekly_revenue_equal_allocation_by_load_skew_$(plant_slug).png"))
+        println("Saved -> weekly_revenue_equal_allocation_by_load_skew_$(plant_slug).png")
+    end
+end
+
+plot_weekly_revenue_equal_by_skew()

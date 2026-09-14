@@ -416,7 +416,7 @@ function main()
     p_violin = plot(;
         xlabel = "Hydro Energy Budget",
         ylabel = "Revenue Increase: Greedy vs Equal (%)",
-        title = "Distribution of Greedy Allocation Revenue Increase",
+        #title = "Distribution of Greedy Allocation Revenue Increase",
         xticks = (1:3, first.(budget_levels)),
         legend = :topright,
         size = (950, 600),
@@ -477,20 +477,21 @@ function plot_weekly_revenue_equal_by_budget()
     function plot_weekly_revenue(revenue_df::DataFrame, title::String, output_name::String)
         p = plot(;
             xlabel = "Week Number",
-            ylabel = "Weekly Revenue (Equal Allocation)",
-            title = title,
-            legend = :bottomright,
+            ylabel = "Weekly Revenue (\$ billion)",
+            #title = title,
+            legend = :topright,
             size = (950, 600),
             dpi = 150,
             left_margin = 10Plots.mm,
             right_margin = 20Plots.mm,
+            bottom_margin = 10Plots.mm,
         )
 
         for budget_level in budget_order
             subset = revenue_df[revenue_df.budget_level .== budget_level, :]
             isempty(subset) && continue
             sort!(subset, :week_start)
-            plot!(p, week.(subset.week_start), subset.equal_revenue;
+            plot!(p, week.(subset.week_start), subset.equal_revenue./1e6;
                 label = "$(budget_level) budget",
                 marker = :circle,
                 color = budget_colors[budget_level],

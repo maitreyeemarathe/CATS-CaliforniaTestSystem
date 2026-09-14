@@ -369,7 +369,7 @@ function main()
     p_violin = plot(;
         xlabel = "Pmin Scale",
         ylabel = "Revenue Increase: Greedy vs Equal (%)",
-        title = "Distribution of Greedy Allocation Revenue Increase",
+        #title = "Distribution of Greedy Allocation Revenue Increase",
         xticks = (1:length(pmin_cases),  ["0%", "50%", "100%"]),
         legend = :topright,
         size = (950, 600),
@@ -415,3 +415,58 @@ function main()
 end
 
 main()
+
+function plot_weekly_revenue_equal_by_pmin()
+    weekly_revenue_df = CSV.read(joinpath(@__DIR__, "pmin_weekly_revenue_equal_vs_greedy.csv"), DataFrame)
+    pmin_labels = Dict("ps0" => "0%", "ps50" => "50%", "ps100" => "100%")
+    weekly_revenue_df.pmin_label = [get(pmin_labels, case, case) for case in weekly_revenue_df.pmin_case]
+
+    function plot_weekly_revenue(revenue_df::DataFrame, output_name::String)
+        p = plot(;
+            xlabel = "Week Start Date",
+            ylabel = "Weekly Revenue (billion \$)",
+            #title = title,
+            legend = :topright,
+            size = (950, 600),
+            dpi = 150,
+            left_margin = 10Plots.mm,
+            right_margin = 20Plots.mm,
+            bottom_margin = 10Plots.mm,
+            #xrotation = 45,
+        )
+
+        for ps in pmin_cases
+            subset = revenue_df[revenue_df.pmin_case .== ps, :]
+            isempty(subset) && continue
+            sort!(subset, :week_start)
+            plot!(p, week.(subset.week_start), subset.equal_revenue./(1e6);
+                label = "$(pmin_labels[ps]) Pmin",
+                marker = :circle,
+                color = pmin_colors[ps],
+            )
+        end
+
+        savefig(p, joinpath(@__DIR__, output_name))
+        println("Saved -> $(output_name)")
+    end
+
+    for plant in unique(weekly_revenue_df.plant)
+        plant_revenue = weekly_revenue_df[weekly_revenue_df.plant .== plant, :]
+        plant_slug = lowercase(replace(plant, " " => "_"))
+        plot_weekly_revenue(
+            plant_revenue,
+            "weekly_revenue_equal_allocation_by_pmin_scale_$(plant_slug).png",
+        )
+    end
+
+    total_revenue = combine(
+        groupby(weekly_revenue_df, [:week_start, :pmin_case]),
+        :equal_revenue => sum => :equal_revenue,
+    )
+    plot_weekly_revenue(
+        total_revenue,
+        "weekly_revenue_equal_allocation_by_pmin_scale_all_plants.png",
+    )
+end
+
+plot_weekly_revenue_equal_by_pmin()
